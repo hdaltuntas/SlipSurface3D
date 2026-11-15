@@ -36,21 +36,38 @@ from PySide6.QtWidgets import (
 )
 
 from slipsurface3d.analysis import AnalysisResults3D
-from slipsurface3d.geometry.surfaces import EllipsoidSurface
+from slipsurface3d.cross_section import compare_2d_cross_section, export_2d_slp_json
+from slipsurface3d.geometry.surfaces import (
+    EllipsoidSurface,
+    MultiPlaneWedgeSurface,
+    WedgePlane3D,
+)
 from slipsurface3d.geometry.terrain import (
     BoreholeLayer,
     BoreholeLog,
     simple_3d_slope,
 )
-from slipsurface3d.lem.solvers import METHODS_3D
+from slipsurface3d.lem.solvers import INTERCOLUMN_FUNCTIONS, METHODS_3D
 from slipsurface3d.loads.supports import (
     SUPPORT_KINDS_3D,
+    BoltPatternSpec3D,
     PatchLoad3D,
     SupportType3D,
     TensionCrack3D,
+    generate_bolt_pattern_3d,
 )
 from slipsurface3d.materials.models import MODEL_LABELS
+from slipsurface3d.probabilistic import (
+    RandomVarSpec3D,
+    run_probabilistic_3d,
+    run_sensitivity_3d,
+)
 from slipsurface3d.project import PALETTE_3D, MaterialSpec3D, Project3D
+from slipsurface3d.seepage import SeepageBC3D
+from slipsurface3d.seismic import (
+    estimate_newmark_displacement_3d,
+    find_yield_acceleration_3d,
+)
 
 
 def _dspin(
@@ -638,10 +655,13 @@ class LoadsSupports3DDialog(QDialog):
         vb.addWidget(self.bolt_tbl, 1)
         bb_row = QHBoxLayout()
         b_add_b = QPushButton("+ Add 3D Bolt")
+        b_pat_b = QPushButton("⊞ Generate Bolt Pattern...")
         b_del_b = QPushButton("− Remove")
         b_add_b.clicked.connect(self._add_bolt)
+        b_pat_b.clicked.connect(self._generate_pattern_dialog)
         b_del_b.clicked.connect(lambda: self.bolt_tbl.removeRow(self.bolt_tbl.currentRow()))
         bb_row.addWidget(b_add_b)
+        bb_row.addWidget(b_pat_b)
         bb_row.addWidget(b_del_b)
         bb_row.addStretch(1)
         vb.addLayout(bb_row)
@@ -703,6 +723,56 @@ class LoadsSupports3DDialog(QDialog):
         self._insert_bolt_row(
             f"Bolt {self.bolt_tbl.rowCount() + 1}", xm, ym, 5.0, xm + 12.0, ym, 1.5
         )
+
+    def _generate_pattern_dialog(self) -> None:
+        p = self._proj_copy
+        mdl = p.build_model()
+        sub = QDialog(self)
+        sub.setWindowTitle("Generate 3D Bolt Pattern")
+        fl = QFormLayout(sub)
+        x0_sp = _dspin(p.x_min, p.x_max, p.x_min + 0.30 * (p.x_max - p.x_min), 2, 1.0, "m")
+        x1_sp = _dspin(p.x_min, p.x_max, p.x_min + 0.60 * (p.x_max - p.x_min), 2, 1.0, "m")
+        y0_sp = _dspin(p.y_min, p.y_max, p.y_min + 0.20 * (p.y_max - p.y_min), 2, 1.0, "m")
+        y1_sp = _dspin(p.y_min, p.y_max, p.y_max - 0.20 * (p.y_max - p.y_min), 2, 1.0, "m")
+        sx_sp = _dspin(0.5, 50.0, 4.0, 2, 0.5, "m")
+        sy_sp = _dspin(0.5, 50.0, 4.0, 2, 0.5, "m")
+        len_sp = _dspin(1.0, 80.0, 14.0, 2, 1.0, "m")
+        plg_sp = _dspin(0.0, 85.0, 15.0, 1, 2.5, "deg")
+        az_sp = _dspin(0.0, 360.0, 0.0, 1, 15.0, "deg")
+        stag_chk = QCheckBox("Stagger alternate rows")
+        fl.addRow("Patch X min:", x0_sp)
+        fl.addRow("Patch X max:", x1_sp)
+        fl.addRow("Patch Y min:", y0_sp)
+        fl.addRow("Patch Y max:", y1_sp)
+        fl.addRow("Spacing ΔX:", sx_sp)
+        fl.addRow("Spacing ΔY:", sy_sp)
+        fl.addRow("Bolt Length:", len_sp)
+        fl.addRow("Plunge Angle:", plg_sp)
+        fl.addRow("Trend Azimuth:", az_sp)
+        fl.addRow("", stag_chk)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(sub.accept)
+        bb.rejected.connect(sub.reject)
+        fl.addRow(bb)
+        if not sub.exec():
+            return
+        spec = BoltPatternSpec3D(
+            x_min=x0_sp.value(),
+            x_max=x1_sp.value(),
+            y_min=y0_sp.value(),
+            y_max=y1_sp.value(),
+            spacing_x=sx_sp.value(),
+            spacing_y=sy_sp.value(),
+            length_m=len_sp.value(),
+            plunge_deg=plg_sp.value(),
+            trend_azimuth_deg=az_sp.value(),
+            stagger_rows=stag_chk.isChecked(),
+        )
+        for b in generate_bolt_pattern_3d(mdl.ground_z, spec):
+            hd, tp = b["head"], b["tip"]
+            self._insert_bolt_row(b["label"], hd[0], hd[1], hd[2], tp[0], tp[1], tp[2])
 
     def _on_accept(self) -> None:
         try:
@@ -786,33 +856,51 @@ class AnalysisSurfaceDialog(QDialog):
         self.az_sp = _dspin(0.0, 360.0, an.azimuth_deg, 1, 5.0, "deg")
         self.adm_chk = QCheckBox("Enforce physical admissibility (Whitman & Bailey m_α)")
         self.adm_chk.setChecked(an.check_admissibility)
+        self.gle_cb = QComboBox()
+        self.gle_cb.addItems(list(INTERCOLUMN_FUNCTIONS))
+        self.gle_cb.setCurrentText(an.gle_interslice)
+        self.workers_sp = QSpinBox()
+        self.workers_sp.setRange(0, 64)
+        self.workers_sp.setValue(an.n_workers)
+        self.workers_sp.setSpecialValueText("Auto (Multi-Core)")
 
         fm.addRow("Columns along X (nx):", self.nx_sp)
         fm.addRow("Columns along Y (ny):", self.ny_sp)
+        fm.addRow("GLE Interslice f(ξ):", self.gle_cb)
+        fm.addRow("Search Threads:", self.workers_sp)
         fm.addRow("Sliding Direction:", self.slide_cb)
         fm.addRow("Custom Azimuth:", self.az_sp)
         fm.addRow("", self.adm_chk)
         tabs.addTab(w_m, "Solvers & Columns")
 
-        # Tab 2: Groundwater & Seismic
+        # Tab 2: Groundwater, 3D Seepage & Seismic
         w_gs = QWidget()
         fgs = QFormLayout(w_gs)
         self.pore_cb = QComboBox()
-        self.pore_cb.addItems(["water_table", "ru", "none"])
+        self.pore_cb.addItems(["water_table", "ru", "seepage", "none"])
         self.pore_cb.setCurrentText(an.pore_mode)
         self.ru_sp = _dspin(0.0, 1.0, an.ru, 3, 0.05)
+        sbc = project.seepage_bc or SeepageBC3D()
+        self.seep_hmin_sp = _dspin(
+            -500.0, 2000.0, 0.0 if sbc.head_xmin is None else sbc.head_xmin, 2, 0.5, "m"
+        )
+        self.seep_hmax_sp = _dspin(
+            -500.0, 2000.0, 10.0 if sbc.head_xmax is None else sbc.head_xmax, 2, 0.5, "m"
+        )
         self.kh_sp = _dspin(0.0, 1.5, an.kh, 3, 0.02, "g")
         self.kv_sp = _dspin(-0.8, 0.8, an.kv, 3, 0.02, "g")
         self.both_kv_chk = QCheckBox("Evaluate ±kv and retain governing FoS")
         self.both_kv_chk.setChecked(an.both_kv_signs)
         fgs.addRow("Pore Pressure Mode:", self.pore_cb)
         fgs.addRow("Ru Coefficient:", self.ru_sp)
+        fgs.addRow("3D Seepage Head @ X_min:", self.seep_hmin_sp)
+        fgs.addRow("3D Seepage Head @ X_max:", self.seep_hmax_sp)
         fgs.addRow("Horizontal Seismic kh:", self.kh_sp)
         fgs.addRow("Vertical Seismic kv (+up):", self.kv_sp)
         fgs.addRow("", self.both_kv_chk)
         tabs.addTab(w_gs, "Water & Seismic")
 
-        # Tab 3: 3D Slip Surface Search / User Ellipsoid
+        # Tab 3: 3D Slip Surface Search / User Ellipsoid / Rock Wedge
         w_sf = QWidget()
         fsf = QFormLayout(w_sf)
         sc = project.surface_config
@@ -820,13 +908,15 @@ class AnalysisSurfaceDialog(QDialog):
         self.mode_cb.addItems(["search", "user"])
         self.mode_cb.setCurrentText(sc.mode)
         self.kind_cb = QComboBox()
-        self.kind_cb.addItems(["ellipsoid", "sphere", "spline_patch"])
+        self.kind_cb.addItems(["ellipsoid", "sphere", "spline_patch", "wedge"])
         self.kind_cb.setCurrentText(sc.surface_kind)
         self.effort_cb = QComboBox()
         self.effort_cb.addItems(["fast", "normal", "fine"])
         self.effort_cb.setCurrentText(sc.effort)
         self.opt_az_chk = QCheckBox("Co-optimize ellipsoid horizontal orientation")
         self.opt_az_chk.setChecked(sc.optimize_azimuth)
+        self.sao_chk = QCheckBox("Enable Multi-Scale SAO (3×3 -> 5×5 spline refinement)")
+        self.sao_chk.setChecked(sc.sao_enabled)
 
         us = sc.user_surface or {}
         if us.get("kind") == "composite_ellipsoid_plane":
@@ -838,17 +928,25 @@ class AnalysisSurfaceDialog(QDialog):
         self.ury = _dspin(0.5, 1e10, float(us.get("ry", 24.0)), 2, 1.0, "m")
         self.urz = _dspin(0.5, 1e10, float(us.get("rz", 18.0)), 2, 1.0, "m")
 
+        planes_raw = us.get("planes", []) if us.get("kind") == "multi_plane_wedge" else []
+        p1_d = planes_raw[0] if len(planes_raw) >= 1 else {"dip_deg": 45.0, "dip_dir_deg": 230.0}
+        p2_d = planes_raw[1] if len(planes_raw) >= 2 else {"dip_deg": 45.0, "dip_dir_deg": 130.0}
+        self.w_dip1 = _dspin(1.0, 88.0, float(p1_d.get("dip_deg", 45.0)), 1, 2.0, "deg")
+        self.w_dd1 = _dspin(0.0, 360.0, float(p1_d.get("dip_dir_deg", 230.0)), 1, 5.0, "deg")
+        self.w_dip2 = _dspin(1.0, 88.0, float(p2_d.get("dip_deg", 45.0)), 1, 2.0, "deg")
+        self.w_dd2 = _dspin(0.0, 360.0, float(p2_d.get("dip_dir_deg", 130.0)), 1, 5.0, "deg")
+
         fsf.addRow("Surface Mode:", self.mode_cb)
-        fsf.addRow("Search Surface Geometry:", self.kind_cb)
+        fsf.addRow("Surface / Search Geometry:", self.kind_cb)
         fsf.addRow("Search Effort:", self.effort_cb)
         fsf.addRow("", self.opt_az_chk)
-        fsf.addRow(QLabel("<b>User Ellipsoid (when Mode = user):</b>"))
-        fsf.addRow("Centre Xc:", self.uxc)
-        fsf.addRow("Centre Yc:", self.uyc)
-        fsf.addRow("Centre Zc:", self.uzc)
-        fsf.addRow("Semi-Axis Rx:", self.urx)
-        fsf.addRow("Semi-Axis Ry:", self.ury)
-        fsf.addRow("Semi-Axis Rz:", self.urz)
+        fsf.addRow("", self.sao_chk)
+        fsf.addRow(QLabel("<b>User Ellipsoid (Mode=user, Geometry=ellipsoid/sphere):</b>"))
+        fsf.addRow("Centre Xc / Yc / Zc:", self._row3(self.uxc, self.uyc, self.uzc))
+        fsf.addRow("Semi-Axes Rx / Ry / Rz:", self._row3(self.urx, self.ury, self.urz))
+        fsf.addRow(QLabel("<b>User 3D Rock Wedge (Mode=user, Geometry=wedge):</b>"))
+        fsf.addRow("Joint A Dip / Dip-Dir:", self._row2(self.w_dip1, self.w_dd1))
+        fsf.addRow("Joint B Dip / Dip-Dir:", self._row2(self.w_dip2, self.w_dd2))
         tabs.addTab(w_sf, "3D Slip Surface")
 
         layout.addWidget(tabs, 1)
@@ -859,6 +957,25 @@ class AnalysisSurfaceDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+    @staticmethod
+    def _row2(w1: QWidget, w2: QWidget) -> QWidget:
+        box = QWidget()
+        hl = QHBoxLayout(box)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(w1)
+        hl.addWidget(w2)
+        return box
+
+    @staticmethod
+    def _row3(w1: QWidget, w2: QWidget, w3: QWidget) -> QWidget:
+        box = QWidget()
+        hl = QHBoxLayout(box)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(w1)
+        hl.addWidget(w2)
+        hl.addWidget(w3)
+        return box
+
     def _on_accept(self) -> None:
         selected = [k for k, chk in self.meth_checks.items() if chk.isChecked()]
         if not selected:
@@ -868,6 +985,8 @@ class AnalysisSurfaceDialog(QDialog):
         an.methods = selected
         an.nx = self.nx_sp.value()
         an.ny = self.ny_sp.value()
+        an.gle_interslice = self.gle_cb.currentText()
+        an.n_workers = self.workers_sp.value()
         an.sliding_mode = self.slide_cb.currentText()
         an.azimuth_deg = self.az_sp.value()
         an.check_admissibility = self.adm_chk.isChecked()
@@ -876,25 +995,48 @@ class AnalysisSurfaceDialog(QDialog):
         an.kh = self.kh_sp.value()
         an.kv = self.kv_sp.value()
         an.both_kv_signs = self.both_kv_chk.isChecked()
+        if an.pore_mode == "seepage":
+            self._project.seepage_bc = SeepageBC3D(
+                head_xmin=self.seep_hmin_sp.value(),
+                head_xmax=self.seep_hmax_sp.value(),
+            )
 
         sc = self._project.surface_config
         sc.mode = self.mode_cb.currentText()
         sc.surface_kind = self.kind_cb.currentText()
+        if sc.surface_kind == "wedge":
+            sc.mode = "user"
         sc.effort = self.effort_cb.currentText()
         sc.primary_method = selected[0]
         sc.optimize_azimuth = self.opt_az_chk.isChecked()
-        if sc.mode == "user" and (
-            sc.user_surface is None or sc.user_surface.get("kind") == "ellipsoid"
-        ):
-            sc.user_surface = EllipsoidSurface(
-                xc=self.uxc.value(),
-                yc=self.uyc.value(),
-                zc=self.uzc.value(),
-                rx=self.urx.value(),
-                ry=self.ury.value(),
-                rz=self.urz.value(),
-                azimuth_deg=an.azimuth_deg if an.sliding_mode == "custom" else 180.0,
-            ).to_dict()
+        sc.sao_enabled = self.sao_chk.isChecked()
+        if sc.mode == "user":
+            if sc.surface_kind == "wedge":
+                p = self._project
+                ym = 0.5 * (p.y_min + p.y_max)
+                x0 = p.x_min + 0.20 * (p.x_max - p.x_min)
+                z0 = float(p.build_model().ground_z(x0, ym))
+                sc.user_surface = MultiPlaneWedgeSurface(
+                    planes=[
+                        WedgePlane3D(
+                            self.w_dip1.value(), self.w_dd1.value(), x0, ym, z0, "Joint A"
+                        ),
+                        WedgePlane3D(
+                            self.w_dip2.value(), self.w_dd2.value(), x0, ym, z0, "Joint B"
+                        ),
+                    ],
+                    bounds=(p.x_min, p.x_max, p.y_min, p.y_max),
+                ).to_dict()
+            elif sc.user_surface is None or sc.user_surface.get("kind") == "ellipsoid":
+                sc.user_surface = EllipsoidSurface(
+                    xc=self.uxc.value(),
+                    yc=self.uyc.value(),
+                    zc=self.uzc.value(),
+                    rx=self.urx.value(),
+                    ry=self.ury.value(),
+                    rz=self.urz.value(),
+                    azimuth_deg=an.azimuth_deg if an.sliding_mode == "custom" else 180.0,
+                ).to_dict()
         self.accept()
 
 
@@ -987,3 +1129,255 @@ class ColumnDataDialog(QDialog):
                         for c in range(self.table.columnCount())
                     ]
                 )
+
+
+class ProbabilisticSensitivity3DDialog(QDialog):
+    """3D Latin Hypercube / Monte Carlo Reliability & Tornado Sensitivity Dialog."""
+
+    def __init__(
+        self,
+        project: Project3D,
+        results: AnalysisResults3D | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("3D Probabilistic Reliability & Tornado Sensitivity")
+        self.resize(760, 500)
+        self._project = project
+        self._results = results
+
+        layout = QVBoxLayout(self)
+        cfg_box = QGroupBox("Probabilistic Simulation Settings")
+        fl = QFormLayout(cfg_box)
+        self.samples_sp = QSpinBox()
+        self.samples_sp.setRange(20, 5000)
+        self.samples_sp.setValue(200)
+        self.samp_cb = QComboBox()
+        self.samp_cb.addItems(["lhs", "mc"])
+        self.cov_c_sp = _dspin(0.02, 0.80, 0.20, 2, 0.05)
+        self.std_phi_sp = _dspin(0.2, 15.0, 2.5, 1, 0.5, "deg")
+        fl.addRow("Number of Realizations:", self.samples_sp)
+        fl.addRow("Sampling Scheme:", self.samp_cb)
+        fl.addRow("Cohesion CoV (Lognormal):", self.cov_c_sp)
+        fl.addRow("Friction Angle σ_φ (Normal):", self.std_phi_sp)
+        layout.addWidget(cfg_box)
+
+        run_row = QHBoxLayout()
+        self.btn_prob = QPushButton("▶ Run 3D LHS / Monte Carlo")
+        self.btn_sens = QPushButton("▶ Run 3D Tornado Sensitivity")
+        self.btn_prob.clicked.connect(self.execute_probabilistic)
+        self.btn_sens.clicked.connect(self.execute_sensitivity)
+        run_row.addWidget(self.btn_prob)
+        run_row.addWidget(self.btn_sens)
+        run_row.addStretch(1)
+        layout.addLayout(run_row)
+
+        self.summary_lbl = QLabel("Ready — click Run to evaluate 3D reliability or Tornado swings.")
+        self.summary_lbl.setWordWrap(True)
+        self.summary_lbl.setStyleSheet("font-weight: bold; padding: 4px;")
+        layout.addWidget(self.summary_lbl)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Parameter", "Base", "Min FoS", "Max FoS", "ΔFoS Swing"]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.table, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+
+    def execute_probabilistic(self) -> None:
+        specs: list[RandomVarSpec3D] = []
+        for m in self._project.materials:
+            if m.model in ("MC", "AN"):
+                if m.c > 0.0:
+                    specs.append(
+                        RandomVarSpec3D("c", m.name, "lognormal", cov=self.cov_c_sp.value())
+                    )
+                if m.phi > 0.0:
+                    specs.append(
+                        RandomVarSpec3D("phi", m.name, "normal", std=self.std_phi_sp.value())
+                    )
+            elif m.model == "UD" and m.su > 0.0:
+                specs.append(RandomVarSpec3D("su", m.name, "lognormal", cov=self.cov_c_sp.value()))
+        if not specs:
+            specs.append(
+                RandomVarSpec3D("gamma", self._project.materials[0].name, "normal", cov=0.06)
+            )
+        surf = self._results.critical_surface if self._results is not None else None
+        res = run_probabilistic_3d(
+            self._project,
+            specs,
+            n_samples=self.samples_sp.value(),
+            sampling=self.samp_cb.currentText(),
+            fixed_surface=True,
+            surface=surf,
+        )
+        self.summary_lbl.setText(
+            f"Deterministic FoS = {res.deterministic_fos:.4f} | Mean FoS = {res.mean_fos:.4f} ± {res.std_fos:.4f} | "
+            f"Pf = {100.0 * res.pf:.2f}% | β_N = {res.beta_normal:.2f} | β_LN = {res.beta_lognormal:.2f} | "
+            f"[P5={res.p5:.3f}, P50={res.p50:.3f}, P95={res.p95:.3f}]"
+        )
+
+    def execute_sensitivity(self) -> None:
+        surf = self._results.critical_surface if self._results is not None else None
+        curves = run_sensitivity_3d(self._project, n_points=7, surface=surf)
+        self.table.setRowCount(len(curves))
+        for r, c in enumerate(curves):
+            vals = [
+                c.label,
+                f"{c.base_value:.3g}",
+                f"{c.min_fos:.4f}",
+                f"{c.max_fos:.4f}",
+                f"{c.delta_fos:.4f}",
+            ]
+            for col_i, txt in enumerate(vals):
+                self.table.setItem(r, col_i, QTableWidgetItem(txt))
+        if curves:
+            self.summary_lbl.setText(
+                f"Top governing parameter: {curves[0].label} (Tornado ΔFoS = {curves[0].delta_fos:.4f})"
+            )
+
+
+class SeismicNewmark3DDialog(QDialog):
+    """3D Critical Yield Acceleration (k_y) & Empirical Newmark Permanent Displacement Dialog."""
+
+    def __init__(
+        self,
+        project: Project3D,
+        results: AnalysisResults3D | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("3D Seismic Yield Acceleration (ky) & Newmark Displacement")
+        self.resize(560, 340)
+        self._project = project
+        self._results = results
+
+        layout = QVBoxLayout(self)
+        fl = QFormLayout()
+        self.pga_sp = _dspin(0.02, 2.50, 0.35, 3, 0.05, "g")
+        self.mw_sp = _dspin(4.5, 9.2, 6.8, 1, 0.2)
+        fl.addRow("Design Peak Ground Accel (PGA):", self.pga_sp)
+        fl.addRow("Moment Magnitude (Mw):", self.mw_sp)
+        layout.addLayout(fl)
+
+        self.run_btn = QPushButton("▶ Compute 3D ky & Newmark Displacements")
+        self.run_btn.clicked.connect(self.execute_seismic)
+        layout.addWidget(self.run_btn)
+
+        self.out_lbl = QLabel("Press Compute to solve for FoS(ky) = 1.000.")
+        self.out_lbl.setWordWrap(True)
+        self.out_lbl.setStyleSheet("padding: 8px; font-size: 13px;")
+        layout.addWidget(self.out_lbl, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+
+    def execute_seismic(self) -> None:
+        surf = self._results.critical_surface if self._results is not None else None
+        ky_res = find_yield_acceleration_3d(self._project, surface=surf)
+        if not ky_res.converged:
+            self.out_lbl.setText(f"ky Search Status: {ky_res.message}")
+            return
+        nm = estimate_newmark_displacement_3d(
+            ky_g=ky_res.ky_g, pga_g=self.pga_sp.value(), mw=self.mw_sp.value()
+        )
+        self.out_lbl.setText(
+            f"<b>Static 3D FoS (kh = 0):</b> {ky_res.static_fos:.4f}<br>"
+            f"<b>Critical Yield Acceleration k_y:</b> {ky_res.ky_g:.4f} g "
+            f"(FoS @ ky = {ky_res.fos_at_ky:.4f})<br><br>"
+            f"<b>Jibson (2007) Median Displacement:</b> {nm.jibson_2007_median_cm:.2f} cm "
+            f"(16–84%: {nm.jibson_2007_p16_cm:.2f} – {nm.jibson_2007_p84_cm:.2f} cm)<br>"
+            f"<b>Ambraseys &amp; Menu (1988) Displacement:</b> {nm.ambraseys_menu_cm:.2f} cm"
+        )
+
+
+class CrossSectionComparisonDialog(QDialog):
+    """Interactive 2D Cross-Section Slicer & F_3D / F_2D End-Effect Analyzer."""
+
+    def __init__(
+        self,
+        project: Project3D,
+        results: AnalysisResults3D | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("2D Cross-Section Extraction & F_3D / F_2D End-Effect Comparison")
+        self.resize(680, 420)
+        self._project = project
+        self._results = results
+
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        ym = 0.5 * (project.y_min + project.y_max)
+        self.y_sp = _dspin(project.y_min, project.y_max, ym, 2, 1.0, "m")
+        btn_eval = QPushButton("▶ Compare 3D vs 2D at y = y0")
+        btn_exp = QPushButton("Export 2D .slp.json...")
+        btn_eval.clicked.connect(self.evaluate_section)
+        btn_exp.clicked.connect(self.export_section_dialog)
+        top.addWidget(QLabel("Section Plane y0:"))
+        top.addWidget(self.y_sp)
+        top.addWidget(btn_eval)
+        top.addWidget(btn_exp)
+        layout.addLayout(top)
+
+        self.banner = QLabel("Click Compare to evaluate 2D plane-strain FoS vs 3D FoS.")
+        self.banner.setWordWrap(True)
+        self.banner.setStyleSheet("font-weight: bold; padding: 6px;")
+        layout.addWidget(self.banner)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["LEM Method", "F_3D", "F_2D (Section)", "F_3D / F_2D Ratio"]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.table, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+
+    def evaluate_section(self) -> None:
+        try:
+            cmp_res = compare_2d_cross_section(
+                self._project, results=self._results, y0=self.y_sp.value()
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "2D Section Comparison", str(exc))
+            return
+        self.banner.setText(
+            f"Section y0 = {cmp_res.y0:.2f} m | Primary F_3D = {cmp_res.primary_fos_3d:.4f} vs "
+            f"F_2D = {cmp_res.primary_fos_2d:.4f} -> 3D End-Effect Ratio = {cmp_res.primary_ratio_3d_2d:.4f}"
+        )
+        meths = list(cmp_res.fos_3d_by_method.keys())
+        self.table.setRowCount(len(meths))
+        for r, m in enumerate(meths):
+            f3 = cmp_res.fos_3d_by_method[m]
+            f2 = cmp_res.fos_2d_by_method[m]
+            rt = cmp_res.end_effect_ratios[m]
+            for c_i, txt in enumerate(
+                [
+                    METHODS_3D[m][0],
+                    f"{f3:.4f}" if np.isfinite(f3) else "N/A",
+                    f"{f2:.4f}" if np.isfinite(f2) else "N/A",
+                    f"{rt:.4f}" if np.isfinite(rt) else "N/A",
+                ]
+            ):
+                self.table.setItem(r, c_i, QTableWidgetItem(txt))
+
+    def export_section_dialog(self) -> None:
+        fn, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Extracted 2D Section (.slp.json)",
+            f"section_y{self.y_sp.value():.1f}.slp.json",
+            "2D SlipSurface Projects (*.slp.json);;JSON Files (*.json)",
+        )
+        if not fn:
+            return
+        export_2d_slp_json(fn, self._project, y0=self.y_sp.value())

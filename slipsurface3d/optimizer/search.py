@@ -1,17 +1,23 @@
-"""Global 3D critical slip surface search (Cuckoo Search + Nelder-Mead local polish).
+"""Global 3D critical slip surface search (Parallel Cuckoo Search + Nelder-Mead + Multi-Scale SAO).
 
 Supports searching over:
 * ``"sphere"``       : 4-parameter spherical slip surfaces ``(xc, yc, zc, r)``
 * ``"ellipsoid"``    : 6/7-parameter tri-axial ellipsoids ``(xc, yc, zc, rx, ry, rz[, azimuth])``
 * ``"spline_patch"`` : Non-ellipsoidal 3D spline bowls perturbing the critical ellipsoid
+* Multi-scale **Surface Altering Optimization (SAO)**: ``3x3 -> 5x5`` Laplacian-regularized
+  local ``SplinePatchSurface`` deformation refining any critical sphere or ellipsoid.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
+import pyvista as pv
+from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import minimize
 
 from slipsurface3d.geometry.surfaces import (
@@ -46,6 +52,9 @@ class SearchSettings3D:
     effort: str = "normal"  # fast | normal | fine
     primary_method: str = "bishop"
     optimize_azimuth: bool = False
+    sao_enabled: bool = False
+    n_workers: int = 1  # 1 = serial, 0 = auto multi-core, >=2 = explicit worker threads
+    gle_interslice: str = "half-sine"
     check_admissibility: bool = True
     m_alpha_min: float = M_ALPHA_MIN_DEFAULT
     seed: int = 42
@@ -61,21 +70,13 @@ class SearchResult3D:
     critical_result: LEMResult3D
     trials: list[tuple[SlipSurface3D, float]] = field(default_factory=list)
     evaluations: int = 0
+    cancelled: bool = False
 
 
-def _detect_slope_crest_toe(model: SlopeModel3D) -> tuple[float, float, float, float, float]:
-    """Estimate (x_low, x_high, z_low, z_high, default_azimuth_deg) on central Y profile."""
-    ym = 0.5 * (model.y_min + model.y_max)
-    xs = np.linspace(model.x_min, model.x_max, 81)
-    zs = model.ground_z(xs, np.full_like(xs, ym))
-    z_low = float(np.min(zs))
-    z_high = float(np.max(zs))
-    i_low = int(np.argmin(zs))
-    i_high = int(np.argmax(zs))
-    x_low = float(xs[i_low])
-    x_high = float(xs[i_high])
-    az = 180.0 if x_high >= x_low else 0.0
-    return x_low, x_high, z_low, z_high, az
+def _resolve_workers(n_workers: int) -> int:
+    if n_workers == 0:
+        return max(1, min(os.cpu_count() or 2, 6))
+    return max(1, int(n_workers))
 
 
 def _parameter_bounds(
@@ -83,10 +84,6 @@ def _parameter_bounds(
     settings: SearchSettings3D,
     default_az: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    x_low, x_high, z_low, z_high, _ = (
-        _detect_slope_crest_toe(model) if False else (0.0, 0.0, 0.0, 0.0, default_az)
-    )
-    # Inline clean slope geometry statistics
     ym = 0.5 * (model.y_min + model.y_max)
     xs = np.linspace(model.x_min, model.x_max, 81)
     zs = model.ground_z(xs, np.full_like(xs, ym))
@@ -162,6 +159,120 @@ def _levy_step(rng: np.random.Generator, dim: int, beta: float = 1.5) -> np.ndar
     return u / (np.abs(v) ** (1.0 / beta) + 1e-12)
 
 
+def _laplacian_penalty(ctrl: np.ndarray, rz: float) -> float:
+    """Discrete second-difference roughness regularization on a (nu, nv) control grid."""
+    pen = 0.0
+    if ctrl.shape[0] >= 3:
+        d2u = ctrl[:-2, :] - 2.0 * ctrl[1:-1, :] + ctrl[2:, :]
+        pen += float(np.mean((d2u / max(rz, 1.0)) ** 2))
+    if ctrl.shape[1] >= 3:
+        d2v = ctrl[:, :-2] - 2.0 * ctrl[:, 1:-1] + ctrl[:, 2:]
+        pen += float(np.mean((d2v / max(rz, 1.0)) ** 2))
+    return 2.5e-3 * pen
+
+
+def run_sao_refinement(
+    base_ellipsoid: EllipsoidSurface,
+    base_fos: float,
+    model: SlopeModel3D,
+    materials: list[Material3D],
+    col_opts: ColumnOptions,
+    method: str = "bishop",
+    gle_interslice: str = "half-sine",
+    solver_tolerance: float = 1e-4,
+    solver_max_iter: int = 60,
+    check_admissibility: bool = True,
+    m_alpha_min: float = M_ALPHA_MIN_DEFAULT,
+    material_colors: list[str] | None = None,
+    max_fev_coarse: int = 45,
+    max_fev_fine: int = 55,
+    cancel_check: Callable[[], bool] | None = None,
+    best_surface_cb: Callable[[SlipSurface3D, float], None] | None = None,
+) -> tuple[SlipSurface3D, float, list[tuple[SlipSurface3D, float]], int]:
+    """Multi-scale Surface Altering Optimization (SAO): 3x3 coarse -> 5x5 fine spline bowl."""
+    max_amp = 0.25 * base_ellipsoid.rz
+    sao_trials: list[tuple[SlipSurface3D, float]] = []
+    evals = 0
+    best_surf: SlipSurface3D = base_ellipsoid
+    best_f = float(base_fos)
+
+    def eval_ctrl(ctrl_2d: np.ndarray, reg: bool = True) -> float:
+        nonlocal evals, best_surf, best_f
+        if cancel_check is not None and cancel_check():
+            return PENALTY_FOS
+        if np.any(np.abs(ctrl_2d) > max_amp):
+            return PENALTY_FOS
+        evals += 1
+        sp_surf = SplinePatchSurface(base=base_ellipsoid, control_dz=ctrl_2d)
+        try:
+            cols_s = discretize_columns(
+                model, sp_surf, materials, opts=col_opts, material_colors=material_colors
+            )
+            res_s = solve_surface_3d(
+                cols_s,
+                method=method,
+                tolerance=solver_tolerance,
+                max_iter=solver_max_iter,
+                m_alpha_min=m_alpha_min,
+                interslice=gle_interslice,
+            )
+        except ColumnDiscretizationError:
+            return PENALTY_FOS
+        if not res_s.ok or (check_admissibility and not res_s.admissible):
+            return PENALTY_FOS
+        raw_fos = float(res_s.fos)
+        sao_trials.append((sp_surf, raw_fos))
+        if raw_fos < best_f - 1e-6:
+            best_f = raw_fos
+            best_surf = sp_surf
+            if best_surface_cb is not None:
+                best_surface_cb(best_surf, best_f)
+        return raw_fos + (_laplacian_penalty(ctrl_2d, base_ellipsoid.rz) if reg else 0.0)
+
+    # Stage 1: Coarse 3x3 control grid (9 DOFs)
+    z0_3 = np.zeros(9, dtype=float)
+    step_3 = 0.05 * base_ellipsoid.rz
+    simplex_3 = np.vstack([z0_3, z0_3 + np.eye(9) * step_3])
+    nm_3 = minimize(
+        lambda v: eval_ctrl(np.asarray(v, dtype=float).reshape(3, 3), reg=True),
+        z0_3,
+        method="Nelder-Mead",
+        options={"initial_simplex": simplex_3, "maxfev": max(20, max_fev_coarse), "fatol": 4e-4},
+    )
+    ctrl_3 = (
+        np.clip(np.asarray(nm_3.x, dtype=float).reshape(3, 3), -max_amp, max_amp)
+        if np.isfinite(nm_3.fun) and nm_3.fun < PENALTY_FOS
+        else np.zeros((3, 3), dtype=float)
+    )
+
+    if cancel_check is not None and cancel_check():
+        return best_surf, best_f, sao_trials, evals
+
+    # Stage 2: Upsample 3x3 -> 5x5 and refine interior 3x3 sub-block (9 localized DOFs on 5x5 patch)
+    u3 = np.linspace(-1.0, 1.0, 3)
+    u5 = np.linspace(-1.0, 1.0, 5)
+    up_sp = RectBivariateSpline(u3, u3, ctrl_3, kx=2, ky=2)
+    ctrl_5_base = np.clip(up_sp(u5, u5), -max_amp, max_amp)
+    eval_ctrl(ctrl_5_base, reg=False)
+
+    inner_0 = ctrl_5_base[1:4, 1:4].ravel().copy()
+    step_5 = 0.03 * base_ellipsoid.rz
+    simplex_5 = np.vstack([inner_0, inner_0 + np.eye(9) * step_5])
+
+    def obj_5(inner_vec: np.ndarray) -> float:
+        c5 = ctrl_5_base.copy()
+        c5[1:4, 1:4] = np.asarray(inner_vec, dtype=float).reshape(3, 3)
+        return eval_ctrl(c5, reg=True)
+
+    minimize(
+        obj_5,
+        inner_0,
+        method="Nelder-Mead",
+        options={"initial_simplex": simplex_5, "maxfev": max(20, max_fev_fine), "fatol": 3e-4},
+    )
+    return best_surf, best_f, sao_trials, evals
+
+
 def search_critical_surface_3d(
     model: SlopeModel3D,
     materials: list[Material3D],
@@ -171,16 +282,22 @@ def search_critical_surface_3d(
     solver_max_iter: int = 60,
     material_colors: list[str] | None = None,
     progress_cb: Callable[[int, int, float], None] | None = None,
+    best_surface_cb: Callable[[SlipSurface3D, float], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> SearchResult3D:
-    """Locate the global minimum-FoS 3D slip surface via Cuckoo Search + Nelder-Mead."""
+    """Locate the global minimum-FoS 3D slip surface via Parallel Cuckoo Search + NM + SAO."""
     settings = settings or SearchSettings3D()
     n_nests, n_gen, nm_fev = EFFORT_PRESETS.get(settings.effort, EFFORT_PRESETS["normal"])
     rng = np.random.default_rng(settings.seed)
+    workers = _resolve_workers(settings.n_workers)
+
+    # Pre-bake scattered RBF horizons onto a dense regular grid for fast exploration
+    fast_model = model.bake_horizon_grids(nx=141, ny=141)
 
     # Determine natural downhill azimuth
-    ym = 0.5 * (model.y_min + model.y_max)
-    xs_p = np.linspace(model.x_min, model.x_max, 61)
-    zs_p = model.ground_z(xs_p, np.full_like(xs_p, ym))
+    ym = 0.5 * (fast_model.y_min + fast_model.y_max)
+    xs_p = np.linspace(fast_model.x_min, fast_model.x_max, 61)
+    zs_p = fast_model.ground_z(xs_p, np.full_like(xs_p, ym))
     if col_opts.sliding_mode == "right_to_left":
         default_az = 180.0
     elif col_opts.sliding_mode == "left_to_right":
@@ -191,11 +308,10 @@ def search_critical_surface_3d(
         default_az = 180.0 if int(np.argmax(zs_p)) >= int(np.argmin(zs_p)) else 0.0
 
     base_kind = "sphere" if settings.surface_kind == "sphere" else "ellipsoid"
-    lo, hi = _parameter_bounds(model, settings, default_az)
+    lo, hi = _parameter_bounds(fast_model, settings, default_az)
     span = np.maximum(hi - lo, 1e-6)
     dim = len(lo)
 
-    # Coarser column grid during global exploration for speed, exact col_opts during polish
     screen_opts = ColumnOptions(
         nx=max(12, min(col_opts.nx, 18)),
         ny=max(10, min(col_opts.ny, 14)),
@@ -210,21 +326,21 @@ def search_critical_surface_3d(
         min_depth=max(col_opts.min_depth, 0.25),
         min_columns=col_opts.min_columns,
         loads=col_opts.loads,
+        pore_pressure_fn=col_opts.pore_pressure_fn,
     )
 
     trials: list[tuple[SlipSurface3D, float]] = []
     eval_count = 0
 
-    def eval_vec(vec: np.ndarray, fine: bool = False) -> float:
-        nonlocal eval_count
+    def _eval_pure(vec: np.ndarray, fine: bool = False) -> tuple[SlipSurface3D | None, float]:
         if np.any(vec < lo) or np.any(vec > hi):
-            return PENALTY_FOS
-        eval_count += 1
+            return None, PENALTY_FOS
         surf = _decode_surface(vec, base_kind, default_az, settings.optimize_azimuth)
         opts_use = col_opts if fine else screen_opts
+        mdl_use = model if fine else fast_model
         try:
             cols = discretize_columns(
-                model, surf, materials, opts=opts_use, material_colors=material_colors
+                mdl_use, surf, materials, opts=opts_use, material_colors=material_colors
             )
             res = solve_surface_3d(
                 cols,
@@ -232,17 +348,43 @@ def search_critical_surface_3d(
                 tolerance=solver_tolerance if fine else max(solver_tolerance, 5e-4),
                 max_iter=solver_max_iter,
                 m_alpha_min=settings.m_alpha_min,
+                interslice=settings.gle_interslice,
             )
         except ColumnDiscretizationError:
-            return PENALTY_FOS
+            return None, PENALTY_FOS
         if not res.ok:
-            return PENALTY_FOS
+            return None, PENALTY_FOS
         if settings.check_admissibility and not res.admissible:
-            return PENALTY_FOS
-        trials.append((surf, float(res.fos)))
-        return float(res.fos)
+            return None, PENALTY_FOS
+        return surf, float(res.fos)
 
-    # Seed population: heuristic mid-slope spheres/ellipsoids + uniform Latin-like samples
+    def eval_vec(vec: np.ndarray, fine: bool = False) -> float:
+        nonlocal eval_count
+        eval_count += 1
+        surf, f_val = _eval_pure(vec, fine=fine)
+        if surf is not None and f_val < PENALTY_FOS:
+            trials.append((surf, f_val))
+        return f_val
+
+    def eval_batch(
+        vecs: list[np.ndarray],
+        fine: bool = False,
+        pool: ThreadPoolExecutor | None = None,
+    ) -> list[float]:
+        nonlocal eval_count
+        eval_count += len(vecs)
+        if pool is not None and len(vecs) > 1:
+            results = list(pool.map(lambda v: _eval_pure(v, fine=fine), vecs))
+        else:
+            results = [_eval_pure(v, fine=fine) for v in vecs]
+        out_f: list[float] = []
+        for surf, f_val in results:
+            if surf is not None and f_val < PENALTY_FOS:
+                trials.append((surf, f_val))
+            out_f.append(f_val)
+        return out_f
+
+    # Seed population: heuristic mid-slope spheres/ellipsoids + uniform random samples
     nests = np.empty((n_nests, dim), dtype=float)
     fit = np.full(n_nests, PENALTY_FOS, dtype=float)
 
@@ -265,7 +407,7 @@ def search_critical_surface_3d(
         if base_kind == "sphere":
             seed_vecs.append(np.array([xc_s, yc_mid, zc_s, rx_s]))
         else:
-            ry_s = np.clip(0.55 * model.span_y, lo[4], hi[4])
+            ry_s = np.clip(0.55 * fast_model.span_y, lo[4], hi[4])
             rz_s = np.clip(r_mult * h_est, lo[5], hi[5])
             v = [xc_s, yc_mid, zc_s, rx_s, ry_s, rz_s]
             if settings.optimize_azimuth:
@@ -277,77 +419,107 @@ def search_critical_surface_3d(
             nests[i] = seed_vecs[i]
         else:
             nests[i] = lo + rng.random(dim) * span
-        fit[i] = eval_vec(nests[i], fine=False)
 
-    # Ensure at least one valid starting nest if domain is narrow
-    if float(np.min(fit)) >= PENALTY_FOS:
-        for _ in range(4 * n_nests):
-            cand = lo + rng.random(dim) * span
-            f_c = eval_vec(cand, fine=False)
-            if f_c < PENALTY_FOS:
-                nests[0] = cand
-                fit[0] = f_c
+    cancelled = False
+    pool_ctx = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        fit[:] = eval_batch([nests[i] for i in range(n_nests)], fine=False, pool=pool_ctx)
+
+        if float(np.min(fit)) >= PENALTY_FOS:
+            extra_cands = [lo + rng.random(dim) * span for _ in range(4 * n_nests)]
+            extra_fits = eval_batch(extra_cands, fine=False, pool=pool_ctx)
+            for cand, f_c in zip(extra_cands, extra_fits, strict=False):
+                if f_c < PENALTY_FOS:
+                    nests[0] = cand
+                    fit[0] = f_c
+                    break
+
+        pa = 0.25
+        best_idx = int(np.argmin(fit))
+        best_vec = nests[best_idx].copy()
+        best_fos = float(fit[best_idx])
+        if best_surface_cb is not None and best_fos < PENALTY_FOS:
+            best_surface_cb(
+                _decode_surface(best_vec, base_kind, default_az, settings.optimize_azimuth),
+                best_fos,
+            )
+
+        for gen in range(n_gen):
+            if cancel_check is not None and cancel_check():
+                cancelled = True
                 break
 
-    pa = 0.25
-    best_idx = int(np.argmin(fit))
-    best_vec = nests[best_idx].copy()
-    best_fos = float(fit[best_idx])
+            # Lévy flights evaluated in parallel batch
+            levy_cands: list[np.ndarray] = []
+            levy_targets: list[int] = []
+            for i in range(n_nests):
+                step = 0.04 * span * _levy_step(rng, dim)
+                if i != best_idx:
+                    step = step * (0.5 + 0.5 * np.abs(nests[i] - best_vec) / span)
+                levy_cands.append(np.clip(nests[i] + step, lo, hi))
+                levy_targets.append(int(rng.integers(0, n_nests)))
 
-    for gen in range(n_gen):
-        # Lévy flights toward global best
-        for i in range(n_nests):
-            step = 0.04 * span * _levy_step(rng, dim)
-            if i != best_idx:
-                step = step * (0.5 + 0.5 * np.abs(nests[i] - best_vec) / span)
-            cand = np.clip(nests[i] + step, lo, hi)
-            j = int(rng.integers(0, n_nests))
-            f_c = eval_vec(cand, fine=False)
-            if f_c < fit[j]:
-                nests[j] = cand
-                fit[j] = f_c
-                if f_c < best_fos:
-                    best_fos = f_c
-                    best_vec = cand.copy()
-                    best_idx = j
+            levy_fits = eval_batch(levy_cands, fine=False, pool=pool_ctx)
+            improved_gen = False
+            for cand, j, f_c in zip(levy_cands, levy_targets, levy_fits, strict=False):
+                if f_c < fit[j]:
+                    nests[j] = cand
+                    fit[j] = f_c
+                    if f_c < best_fos:
+                        best_fos = f_c
+                        best_vec = cand.copy()
+                        best_idx = j
+                        improved_gen = True
 
-        # Abandon fraction pa of worst nests via differential random walk
-        worst_order = np.argsort(fit)[::-1]
-        n_abandon = max(1, int(pa * n_nests))
-        for k_idx in worst_order[:n_abandon]:
-            if k_idx == best_idx:
-                continue
-            r1, r2 = rng.integers(0, n_nests, size=2)
-            cand = np.clip(nests[k_idx] + rng.random(dim) * (nests[r1] - nests[r2]), lo, hi)
-            f_c = eval_vec(cand, fine=False)
-            if f_c < fit[k_idx]:
-                nests[k_idx] = cand
-                fit[k_idx] = f_c
-                if f_c < best_fos:
-                    best_fos = f_c
-                    best_vec = cand.copy()
-                    best_idx = int(k_idx)
+            # Abandon fraction pa of worst nests via differential random walk in parallel batch
+            worst_order = np.argsort(fit)[::-1]
+            n_abandon = max(1, int(pa * n_nests))
+            ab_indices = [int(k_idx) for k_idx in worst_order[:n_abandon] if int(k_idx) != best_idx]
+            ab_cands: list[np.ndarray] = []
+            for k_idx in ab_indices:
+                r1, r2 = rng.integers(0, n_nests, size=2)
+                ab_cands.append(
+                    np.clip(nests[k_idx] + rng.random(dim) * (nests[r1] - nests[r2]), lo, hi)
+                )
+            if ab_cands:
+                ab_fits = eval_batch(ab_cands, fine=False, pool=pool_ctx)
+                for k_idx, cand, f_c in zip(ab_indices, ab_cands, ab_fits, strict=False):
+                    if f_c < fit[k_idx]:
+                        nests[k_idx] = cand
+                        fit[k_idx] = f_c
+                        if f_c < best_fos:
+                            best_fos = f_c
+                            best_vec = cand.copy()
+                            best_idx = k_idx
+                            improved_gen = True
 
-        if progress_cb is not None:
-            progress_cb(gen + 1, n_gen, best_fos)
+            if improved_gen and best_surface_cb is not None and best_fos < PENALTY_FOS:
+                best_surface_cb(
+                    _decode_surface(best_vec, base_kind, default_az, settings.optimize_azimuth),
+                    best_fos,
+                )
+            if progress_cb is not None:
+                progress_cb(gen + 1, n_gen, best_fos)
 
-    # Re-evaluate top 4 distinct nests on full-resolution column grid & Nelder-Mead polish
-    top_indices = np.argsort(fit)[: min(4, n_nests)]
-    fine_best_vec = best_vec.copy()
-    fine_best_fos = eval_vec(fine_best_vec, fine=True)
-    for idx in top_indices:
-        if fit[idx] >= PENALTY_FOS:
-            continue
-        f_val = eval_vec(nests[idx], fine=True)
-        if f_val < fine_best_fos:
-            fine_best_fos = f_val
-            fine_best_vec = nests[idx].copy()
+        # Re-evaluate top 4 distinct nests on full-resolution column grid
+        top_indices = [
+            int(idx) for idx in np.argsort(fit)[: min(4, n_nests)] if fit[idx] < PENALTY_FOS
+        ]
+        fine_vecs = [best_vec.copy()] + [nests[idx].copy() for idx in top_indices]
+        fine_fits = eval_batch(fine_vecs, fine=True, pool=pool_ctx)
+        best_fine_i = int(np.argmin(fine_fits))
+        fine_best_vec = fine_vecs[best_fine_i].copy()
+        fine_best_fos = float(fine_fits[best_fine_i])
+    finally:
+        if pool_ctx is not None:
+            pool_ctx.shutdown(wait=True)
 
-    if fine_best_fos < PENALTY_FOS:
-        # Normalized Nelder-Mead polish on [0, 1]^dim
+    if not cancelled and fine_best_fos < PENALTY_FOS:
         u0 = np.clip((fine_best_vec - lo) / span, 0.0, 1.0)
 
         def nm_obj(u_norm: np.ndarray) -> float:
+            if cancel_check is not None and cancel_check():
+                return PENALTY_FOS
             if np.any(u_norm < 0.0) or np.any(u_norm > 1.0):
                 return PENALTY_FOS
             return eval_vec(lo + u_norm * span, fine=True)
@@ -365,53 +537,36 @@ def search_critical_surface_3d(
     crit_surface: SlipSurface3D = _decode_surface(
         fine_best_vec, base_kind, default_az, settings.optimize_azimuth
     )
+    if best_surface_cb is not None and fine_best_fos < PENALTY_FOS:
+        best_surface_cb(crit_surface, fine_best_fos)
 
-    # Optional non-ellipsoidal 3x3 spline patch deformation stage
-    if settings.surface_kind == "spline_patch" and fine_best_fos < PENALTY_FOS:
+    # Multi-scale Surface Altering Optimization (SAO: 3x3 -> 5x5) when spline_patch or sao_enabled
+    run_sao = (settings.surface_kind == "spline_patch" or settings.sao_enabled) and not cancelled
+    if run_sao and fine_best_fos < PENALTY_FOS:
         assert isinstance(crit_surface, EllipsoidSurface)
-        base_ell = crit_surface
-        max_amp = 0.20 * base_ell.rz
-
-        def spline_obj(dz_flat: np.ndarray) -> float:
-            nonlocal eval_count
-            if np.any(np.abs(dz_flat) > max_amp):
-                return PENALTY_FOS
-            eval_count += 1
-            sp_surf = SplinePatchSurface(base=base_ell, control_dz=dz_flat.reshape(3, 3))
-            try:
-                cols_s = discretize_columns(
-                    model, sp_surf, materials, opts=col_opts, material_colors=material_colors
-                )
-                res_s = solve_surface_3d(
-                    cols_s,
-                    method=settings.primary_method,
-                    tolerance=solver_tolerance,
-                    max_iter=solver_max_iter,
-                    m_alpha_min=settings.m_alpha_min,
-                )
-            except ColumnDiscretizationError:
-                return PENALTY_FOS
-            if not res_s.ok or (settings.check_admissibility and not res_s.admissible):
-                return PENALTY_FOS
-            trials.append((sp_surf, float(res_s.fos)))
-            return float(res_s.fos)
-
-        z0_patch = np.zeros(9, dtype=float)
-        init_simplex = np.vstack([z0_patch, z0_patch + np.eye(9) * (0.04 * base_ell.rz)])
-        nm_sp = minimize(
-            spline_obj,
-            z0_patch,
-            method="Nelder-Mead",
-            options={
-                "initial_simplex": init_simplex,
-                "maxfev": max(30, nm_fev // 2),
-                "fatol": 5e-4,
-            },
+        sao_surf, sao_fos, sao_trials, sao_evals = run_sao_refinement(
+            base_ellipsoid=crit_surface,
+            base_fos=fine_best_fos,
+            model=model,
+            materials=materials,
+            col_opts=col_opts,
+            method=settings.primary_method,
+            gle_interslice=settings.gle_interslice,
+            solver_tolerance=solver_tolerance,
+            solver_max_iter=solver_max_iter,
+            check_admissibility=settings.check_admissibility,
+            m_alpha_min=settings.m_alpha_min,
+            material_colors=material_colors,
+            max_fev_coarse=max(25, nm_fev // 2),
+            max_fev_fine=max(30, (2 * nm_fev) // 3),
+            cancel_check=cancel_check,
+            best_surface_cb=best_surface_cb,
         )
-        if float(nm_sp.fun) < fine_best_fos:
-            crit_surface = SplinePatchSurface(
-                base=base_ell, control_dz=np.asarray(nm_sp.x, dtype=float).reshape(3, 3)
-            )
+        eval_count += sao_evals
+        trials.extend(sao_trials)
+        if sao_fos < fine_best_fos:
+            crit_surface = sao_surf
+            fine_best_fos = sao_fos
 
     crit_cols = discretize_columns(
         model, crit_surface, materials, opts=col_opts, material_colors=material_colors
@@ -422,6 +577,7 @@ def search_critical_surface_3d(
         tolerance=solver_tolerance,
         max_iter=solver_max_iter,
         m_alpha_min=settings.m_alpha_min,
+        interslice=settings.gle_interslice,
     )
     return SearchResult3D(
         critical_surface=crit_surface,
@@ -429,4 +585,93 @@ def search_critical_surface_3d(
         critical_result=crit_res,
         trials=trials,
         evaluations=eval_count,
+        cancelled=cancelled or bool(cancel_check is not None and cancel_check()),
+    )
+
+
+@dataclass
+class SafetyMap3D:
+    """Slope-wide 3D minimum Factor-of-Safety hazard map projected onto ground topography."""
+
+    x_coords: np.ndarray
+    y_coords: np.ndarray
+    z_ground: np.ndarray
+    min_fos: np.ndarray
+    trial_count: np.ndarray
+
+    def to_mesh(self, z_offset: float = 0.04) -> pv.PolyData:
+        """Build a clipped PyVista surface mesh over the covered ground cells colored by ``MinFoS``."""
+        xx, yy = np.meshgrid(self.x_coords, self.y_coords, indexing="ij")
+        zz = self.z_ground + float(z_offset)
+        valid = np.isfinite(self.min_fos)
+        if not np.any(valid):
+            return pv.PolyData()
+        fill_v = float(np.nanmax(self.min_fos))
+        fos_filled = np.where(valid, self.min_fos, fill_v)
+        grid = pv.StructuredGrid(xx, yy, zz)
+        grid["MinFoS"] = fos_filled.ravel(order="F")
+        grid["TrialCount"] = self.trial_count.ravel(order="F").astype(float)
+        grid["CoveredMask"] = valid.ravel(order="F").astype(float)
+        surf = grid.extract_surface()
+        return surf.threshold(0.5, scalars="CoveredMask", preference="point").extract_surface()
+
+
+def compute_safety_map_3d(
+    model: SlopeModel3D,
+    trials: list[tuple[SlipSurface3D, float]],
+    critical_surface: SlipSurface3D | None = None,
+    critical_fos: float | None = None,
+    nx: int = 64,
+    ny: int = 48,
+    min_depth: float = 0.05,
+) -> SafetyMap3D:
+    """Project all admissible 3D trial slip bowls onto ``(x, y)`` ground grid to map minimum FoS."""
+    xs = np.linspace(model.x_min, model.x_max, max(8, nx))
+    ys = np.linspace(model.y_min, model.y_max, max(8, ny))
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    zg = model.ground_z(xx, yy)
+
+    min_fos = np.full((len(xs), len(ys)), np.nan, dtype=float)
+    counts = np.zeros((len(xs), len(ys)), dtype=int)
+
+    all_trials: list[tuple[SlipSurface3D, float]] = [
+        (s, float(f)) for s, f in trials if np.isfinite(f) and 0.0 < f < PENALTY_FOS
+    ]
+    if critical_surface is not None and critical_fos is not None and np.isfinite(critical_fos):
+        all_trials.append((critical_surface, float(critical_fos)))
+
+    if not all_trials:
+        return SafetyMap3D(
+            x_coords=xs, y_coords=ys, z_ground=zg, min_fos=min_fos, trial_count=counts
+        )
+
+    all_trials.sort(key=lambda item: item[1])
+
+    for surf, fos_val in all_trials:
+        fx0, fx1, fy0, fy1 = surf.footprint_bounds()
+        ix0 = max(0, int(np.searchsorted(xs, fx0, side="left")) - 1)
+        ix1 = min(len(xs), int(np.searchsorted(xs, fx1, side="right")) + 1)
+        iy0 = max(0, int(np.searchsorted(ys, fy0, side="left")) - 1)
+        iy1 = min(len(ys), int(np.searchsorted(ys, fy1, side="right")) + 1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            continue
+        sub_x = xx[ix0:ix1, iy0:iy1]
+        sub_y = yy[ix0:ix1, iy0:iy1]
+        sub_zg = zg[ix0:ix1, iy0:iy1]
+        zb = surf.z(sub_x, sub_y)
+        active = np.isfinite(zb) & ((sub_zg - zb) >= min_depth)
+        if not np.any(active):
+            continue
+        sub_cnt = counts[ix0:ix1, iy0:iy1]
+        sub_cnt[active] += 1
+        sub_min = min_fos[ix0:ix1, iy0:iy1]
+        upd = active & (~np.isfinite(sub_min) | (fos_val < sub_min))
+        sub_min[upd] = fos_val
+
+    return SafetyMap3D(
+        x_coords=xs,
+        y_coords=ys,
+        z_ground=zg,
+        min_fos=min_fos,
+        trial_count=counts,
     )

@@ -585,6 +585,70 @@ class SlopeModel3D:
                 out[zf <= z_top + 1e-9] = idx
         return out.reshape(shape)
 
+    def material_indices_columns(
+        self,
+        x_col: np.ndarray,
+        y_col: np.ndarray,
+        z_samples: np.ndarray,
+        material_names: list[str],
+    ) -> np.ndarray:
+        """Fast column-wise material lookup where ``z_samples`` has shape ``(n_cols, n_sub)``.
+
+        Evaluates 3D horizons once per ``(x_col, y_col)`` column instead of ``n_sub`` times.
+        """
+        if self.profile_regions or z_samples.ndim != 2:
+            x_b = np.broadcast_to(x_col[:, None], z_samples.shape)
+            y_b = np.broadcast_to(y_col[:, None], z_samples.shape)
+            return self.material_indices_at(x_b, y_b, z_samples, material_names)
+
+        n_cols, n_sub = z_samples.shape
+        name_to_idx = {name: idx for idx, name in enumerate(material_names)}
+        out = np.zeros((n_cols, n_sub), dtype=int)
+        if self.layers:
+            out[:] = name_to_idx.get(self.layers[0][0], 0)
+            for mat_name, horizon in self.layers[1:]:
+                idx = name_to_idx.get(mat_name, 0)
+                z_top = horizon.z(x_col, y_col)[:, None]
+                out[z_samples <= z_top + 1e-9] = idx
+        return out
+
+    def bake_horizon_grids(self, nx: int = 141, ny: int = 141) -> SlopeModel3D:
+        """Return a fast-evaluating copy with scattered RBF horizons pre-baked onto regular grids."""
+        has_scattered = (
+            self.ground.kind == "scattered"
+            or any(h.kind == "scattered" for _, h in self.layers)
+            or (self.water_table is not None and self.water_table.kind == "scattered")
+        )
+        if not has_scattered:
+            return self
+
+        xs = np.linspace(self.x_min, self.x_max, max(8, nx))
+        ys = np.linspace(self.y_min, self.y_max, max(8, ny))
+        xx, yy = np.meshgrid(xs, ys, indexing="ij")
+
+        def _bake(h: HorizonSurface) -> HorizonSurface:
+            if h.kind != "scattered":
+                return h
+            return HorizonSurface.from_grid(xs, ys, h.z(xx, yy), name=h.name)
+
+        g_fast = _bake(self.ground)
+        layers_fast = [
+            (m_name, g_fast if h is self.ground else _bake(h)) for m_name, h in self.layers
+        ]
+        wt_fast = _bake(self.water_table) if self.water_table is not None else None
+        return SlopeModel3D(
+            x_min=self.x_min,
+            x_max=self.x_max,
+            y_min=self.y_min,
+            y_max=self.y_max,
+            z_min=self.z_min,
+            ground=g_fast,
+            layers=layers_fast,
+            profile_regions=list(self.profile_regions),
+            water_table=wt_fast,
+            name=self.name,
+        )
+
     def ground_mesh(self, nx: int = 64, ny: int = 44) -> pv.StructuredGrid:
         return self.ground.to_mesh(self.x_bounds, self.y_bounds, nx=nx, ny=ny)
 

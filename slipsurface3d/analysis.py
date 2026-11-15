@@ -12,7 +12,11 @@ from slipsurface3d.geometry.surfaces import SlipSurface3D
 from slipsurface3d.geometry.terrain import SlopeModel3D
 from slipsurface3d.lem.columns import ColumnGrid, discretize_columns
 from slipsurface3d.lem.solvers import METHODS_3D, LEMResult3D, solve_surface_3d
-from slipsurface3d.optimizer.search import search_critical_surface_3d
+from slipsurface3d.optimizer.search import (
+    SafetyMap3D,
+    compute_safety_map_3d,
+    search_critical_surface_3d,
+)
 from slipsurface3d.project import Project3D
 
 
@@ -25,8 +29,10 @@ class AnalysisResults3D:
     primary_method: str
     governing_kv: float = 0.0
     trials: list[tuple[SlipSurface3D, float]] = field(default_factory=list)
+    safety_map: SafetyMap3D | None = None
     evaluations: int = 0
     elapsed_s: float = 0.0
+    cancelled: bool = False
 
     @property
     def primary_result(self) -> LEMResult3D:
@@ -43,6 +49,8 @@ def _run_for_kv(
     project: Project3D,
     kv_val: float,
     progress_cb: Callable[[int, int, float], None] | None = None,
+    best_surface_cb: Callable[[SlipSurface3D, float], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> AnalysisResults3D:
     t0 = time.perf_counter()
     model = project.build_model()
@@ -53,6 +61,7 @@ def _run_for_kv(
     sc = project.surface_config
     primary = sc.primary_method if sc.primary_method in an.methods else an.methods[0]
 
+    cancelled = False
     if sc.mode == "user":
         surf = project.user_slip_surface()
         assert surf is not None
@@ -71,11 +80,14 @@ def _run_for_kv(
             solver_max_iter=an.max_iter,
             material_colors=colors,
             progress_cb=progress_cb,
+            best_surface_cb=best_surface_cb,
+            cancel_check=cancel_check,
         )
         surf = sr.critical_surface
         cols = sr.critical_columns
         trials = sr.trials
         evals = sr.evaluations
+        cancelled = sr.cancelled
 
     method_results: dict[str, LEMResult3D] = {}
     for meth in an.methods:
@@ -85,7 +97,17 @@ def _run_for_kv(
             tolerance=an.tolerance,
             max_iter=an.max_iter,
             m_alpha_min=an.m_alpha_min,
+            interslice=an.gle_interslice,
         )
+
+    prim_fos = method_results[primary].fos if primary in method_results else np.nan
+    s_map = compute_safety_map_3d(
+        model,
+        trials,
+        critical_surface=surf,
+        critical_fos=prim_fos,
+        min_depth=an.min_depth,
+    )
 
     elapsed = time.perf_counter() - t0
     return AnalysisResults3D(
@@ -96,28 +118,50 @@ def _run_for_kv(
         primary_method=primary,
         governing_kv=kv_val,
         trials=trials,
+        safety_map=s_map,
         evaluations=evals,
         elapsed_s=elapsed,
+        cancelled=cancelled,
     )
 
 
 def run_analysis_3d(
     project: Project3D,
     progress_cb: Callable[[int, int, float], None] | None = None,
+    best_surface_cb: Callable[[SlipSurface3D, float], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> AnalysisResults3D:
     """Validate and execute 3D slope stability analysis for ``project``."""
     project.validate()
     kv = project.analysis.kv
     if project.analysis.both_kv_signs and abs(kv) > 1e-9:
-        r_pos = _run_for_kv(project, +abs(kv), progress_cb=progress_cb)
-        r_neg = _run_for_kv(project, -abs(kv), progress_cb=progress_cb)
+        r_pos = _run_for_kv(
+            project,
+            +abs(kv),
+            progress_cb=progress_cb,
+            best_surface_cb=best_surface_cb,
+            cancel_check=cancel_check,
+        )
+        r_neg = _run_for_kv(
+            project,
+            -abs(kv),
+            progress_cb=progress_cb,
+            best_surface_cb=best_surface_cb,
+            cancel_check=cancel_check,
+        )
         f_pos = r_pos.critical_fos if np.isfinite(r_pos.critical_fos) else np.inf
         f_neg = r_neg.critical_fos if np.isfinite(r_neg.critical_fos) else np.inf
         best = r_pos if f_pos <= f_neg else r_neg
         best.elapsed_s = r_pos.elapsed_s + r_neg.elapsed_s
         best.evaluations = r_pos.evaluations + r_neg.evaluations
         return best
-    return _run_for_kv(project, kv, progress_cb=progress_cb)
+    return _run_for_kv(
+        project,
+        kv,
+        progress_cb=progress_cb,
+        best_surface_cb=best_surface_cb,
+        cancel_check=cancel_check,
+    )
 
 
 def report_text_3d(project: Project3D, res: AnalysisResults3D) -> str:

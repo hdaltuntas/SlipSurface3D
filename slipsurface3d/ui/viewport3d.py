@@ -22,6 +22,7 @@ from pyvista.plotting.render_window_interactor import RenderWindowInteractor
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
 from slipsurface3d.analysis import AnalysisResults3D
+from slipsurface3d.geometry.surfaces import SlipSurface3D
 from slipsurface3d.project import Project3D
 
 SCALAR_FIELD_OPTIONS: list[tuple[str, str]] = [
@@ -82,6 +83,9 @@ class Viewport3D(QWidget):
         self._show_water: bool = True
         self._show_loads_supports: bool = True
         self._clip_mid_y: bool = False
+        self._show_safety_map: bool = False
+        self._show_force_vectors: bool = True
+        self._live_trial_surface: SlipSurface3D | None = None
         self._selected_col: int = -1
         self._theme: str = "dark"
 
@@ -146,6 +150,8 @@ class Viewport3D(QWidget):
         water: bool | None = None,
         loads_supports: bool | None = None,
         clip_mid_y: bool | None = None,
+        safety_map: bool | None = None,
+        force_vectors: bool | None = None,
     ) -> None:
         if columns is not None:
             self._show_columns = columns
@@ -157,6 +163,15 @@ class Viewport3D(QWidget):
             self._show_loads_supports = loads_supports
         if clip_mid_y is not None:
             self._clip_mid_y = clip_mid_y
+        if safety_map is not None:
+            self._show_safety_map = safety_map
+        if force_vectors is not None:
+            self._show_force_vectors = force_vectors
+        self.rebuild_scene(reset_camera=False)
+
+    def preview_trial_surface(self, surface: SlipSurface3D | None) -> None:
+        """Render or clear a live best-so-far trial slip bowl during global optimization."""
+        self._live_trial_surface = surface
         self.rebuild_scene(reset_camera=False)
 
     def select_column(self, col_idx: int) -> None:
@@ -182,6 +197,7 @@ class Viewport3D(QWidget):
     ) -> None:
         self._project = project
         self._results = results
+        self._live_trial_surface = None
         if active_method is not None:
             self._active_method = active_method
         elif results is not None:
@@ -282,8 +298,14 @@ class Viewport3D(QWidget):
                     pv.Sphere(radius=max(0.18, 0.005 * model.span_x), center=head), color="#facc15"
                 )
 
-        # 4. User preview slip surface (when in Modeler before analysis)
-        if res is None and proj.surface_config.mode == "user":
+        # 4. User preview or live-search trial slip surface (before final results)
+        if res is None and self._live_trial_surface is not None:
+            t_poly = self._live_trial_surface.to_mesh(
+                model.x_bounds, model.y_bounds, ground_fn=model.ground_z, nx=44, ny=44
+            )
+            if t_poly.n_points > 0:
+                pl.add_mesh(t_poly, color="#fb923c", opacity=0.55, smooth_shading=True)
+        elif res is None and proj.surface_config.mode == "user":
             u_surf = proj.user_slip_surface()
             if u_surf is not None:
                 u_poly = u_surf.to_mesh(
@@ -292,8 +314,22 @@ class Viewport3D(QWidget):
                 if u_poly.n_points > 0:
                     pl.add_mesh(u_poly, color="#ef4444", opacity=0.55, smooth_shading=True)
 
-        # 5. Analysis Results: 3D Active Columns & Critical Slip Bowl
+        # 5. Analysis Results: Safety Map, 3D Active Columns, Force Vectors & Critical Slip Bowl
         if res is not None:
+            if self._show_safety_map and res.safety_map is not None:
+                smap_mesh = res.safety_map.to_mesh(z_offset=0.06)
+                if smap_mesh.n_points > 0:
+                    pl.add_mesh(
+                        smap_mesh,
+                        scalars="MinFoS",
+                        cmap="RdYlGn",
+                        clim=(0.8, 2.0),
+                        opacity=0.85,
+                        smooth_shading=True,
+                        scalar_bar_args={"title": "Slope Safety Map (Min FoS)", "color": fg_col},
+                        pickable=False,
+                    )
+
             m_res = res.method_results.get(self._active_method, res.primary_result)
             ugrid = res.columns.to_hex_mesh(
                 sigma_n_eff=m_res.sigma_n_eff,
@@ -317,7 +353,11 @@ class Viewport3D(QWidget):
                         show_edges=True,
                         edge_color="#0f172a",
                         line_width=0.6,
-                        scalar_bar_args={"title": s_name, "color": fg_col},
+                        scalar_bar_args=(
+                            {"title": s_name, "color": fg_col}
+                            if not self._show_safety_map
+                            else None
+                        ),
                         pickable=True,
                     )
                 if 0 <= self._selected_col < ugrid.n_cells:
@@ -329,6 +369,10 @@ class Viewport3D(QWidget):
                         line_width=4.0,
                         pickable=False,
                     )
+                    if self._show_force_vectors:
+                        self._add_column_force_vectors(
+                            pl, res, m_res, self._selected_col, model.span_x
+                        )
 
             if self._show_slip_surface:
                 slip_mesh = res.critical_surface.to_mesh(
@@ -348,6 +392,73 @@ class Viewport3D(QWidget):
         )
         if reset_camera:
             self._apply_camera(pl, self._camera_preset)
+
+    def _add_column_force_vectors(
+        self,
+        pl: pv.BasePlotter,
+        res: AnalysisResults3D,
+        m_res: Any,
+        idx: int,
+        span_x: float,
+    ) -> None:
+        """Render 3D free-body force arrows (W, N', S_mob, U) on selected column ``idx``."""
+        cols = res.columns
+        w_val = float(cols.W[idx])
+        n_val = float(m_res.base_normal_eff[idx]) if m_res.base_normal_eff is not None else 0.0
+        s_val = float(m_res.base_shear_mob[idx]) if m_res.base_shear_mob is not None else 0.0
+        u_val = float(cols.u[idx] * cols.area_base[idx])
+        f_ref = max(w_val, n_val, s_val, u_val, 1e-6)
+        max_len = max(2.2, 0.09 * span_x)
+
+        cx, cy = float(cols.x[idx]), float(cols.y[idx])
+        zb = float(cols.z_base[idx])
+        zcg = float(cols.z_cg[idx])
+        base_pt = np.array([cx, cy, zb], dtype=float)
+
+        # 1. Weight W (downward -Z, gold)
+        if w_val > 0.0:
+            lw = max_len * (0.35 + 0.65 * (w_val / f_ref))
+            pl.add_mesh(
+                pv.Arrow(
+                    start=(cx, cy, zcg + 0.5 * lw),
+                    direction=(0.0, 0.0, -1.0),
+                    scale=lw,
+                ),
+                color="#facc15",
+                pickable=False,
+            )
+
+        # 2. Effective Normal N' (along upward basal normal, sky-blue)
+        n_dir = np.asarray(cols.normal_xyz[idx], dtype=float)
+        if n_val > 0.0 and np.linalg.norm(n_dir) > 1e-6:
+            ln = max_len * (0.35 + 0.65 * (n_val / f_ref))
+            pl.add_mesh(
+                pv.Arrow(start=base_pt - ln * n_dir, direction=n_dir, scale=ln),
+                color="#38bdf8",
+                pickable=False,
+            )
+
+        # 3. Mobilized Shear S_mob (opposing sliding along basal plane, emerald)
+        psi = float(np.radians(cols.azimuth_deg))
+        ca, sa = float(cols.cos_alpha_s[idx]), float(cols.sin_alpha_s[idx])
+        s_dir = np.array([-ca * np.cos(psi), -ca * np.sin(psi), sa], dtype=float)
+        if s_val > 0.0 and np.linalg.norm(s_dir) > 1e-6:
+            ls = max_len * (0.35 + 0.65 * (s_val / f_ref))
+            pl.add_mesh(
+                pv.Arrow(start=base_pt, direction=s_dir, scale=ls),
+                color="#22c55e",
+                pickable=False,
+            )
+
+        # 4. Basal Pore-Water Force U (cyan, slightly offset laterally when > 0)
+        if u_val > 0.02 * f_ref and np.linalg.norm(n_dir) > 1e-6:
+            lu = max_len * (0.30 + 0.60 * (u_val / f_ref))
+            off = np.array([0.15 * cols.dx, 0.15 * cols.dy, 0.0], dtype=float)
+            pl.add_mesh(
+                pv.Arrow(start=base_pt + off - lu * n_dir, direction=n_dir, scale=lu),
+                color="#06b6d4",
+                pickable=False,
+            )
 
     def rebuild_scene(self, reset_camera: bool = False) -> None:
         if self._offscreen_mode:
@@ -380,6 +491,7 @@ class Viewport3D(QWidget):
                     if len(arr) > 0:
                         idx = int(arr[0])
                         self._selected_col = idx
+                        self.rebuild_scene(reset_camera=False)
                         self.columnSelected.emit(idx)
 
             try:

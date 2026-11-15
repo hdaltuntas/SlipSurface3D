@@ -295,6 +295,32 @@ class SplinePatchSurface(SlipSurface3D):
         out[inside] = zb[inside] + dz
         return out
 
+    def gradients(self, x: Any, y: Any, eps: float = 1e-5) -> tuple[np.ndarray, np.ndarray]:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        zb = self.base.z(xa, ya)
+        bdz_dx, bdz_dy = self.base.gradients(xa, ya, eps=eps)
+        inside = np.isfinite(zb) & np.isfinite(bdz_dx) & np.isfinite(bdz_dy)
+        if not np.any(inside):
+            return bdz_dx, bdz_dy
+        u, v, ca, sa = self.base._local_uv(xa[inside], ya[inside])
+        un = u / self.base.rx
+        vn = v / self.base.ry
+        rho2 = un * un + vn * vn
+        taper = np.maximum(1.0 - rho2, 0.0)
+        s_val = self._spline.ev(un, vn)
+        su = self._spline.ev(un, vn, dx=1, dy=0)
+        sv = self._spline.ev(un, vn, dx=0, dy=1)
+        active_taper = rho2 < 1.0
+        d_du = np.where(active_taper, (su * taper - 2.0 * un * s_val) / self.base.rx, 0.0)
+        d_dv = np.where(active_taper, (sv * taper - 2.0 * vn * s_val) / self.base.ry, 0.0)
+        ddx = d_du * ca - d_dv * sa
+        ddy = d_du * sa + d_dv * ca
+        out_x = bdz_dx.copy()
+        out_y = bdz_dy.copy()
+        out_x[inside] = bdz_dx[inside] + ddx
+        out_y[inside] = bdz_dy[inside] + ddy
+        return out_x, out_y
+
     def rotation_center_sz(self, azimuth_deg: float) -> tuple[float, float]:
         return self.base.rotation_center_sz(azimuth_deg)
 
@@ -343,6 +369,149 @@ class MeshSlipSurface(SlipSurface3D):
         }
 
 
+@dataclass
+class WedgePlane3D:
+    """Single planar geological discontinuity (joint, bedding, fault, or tension-crack plane)."""
+
+    dip_deg: float
+    dip_dir_deg: float
+    x0: float = 0.0
+    y0: float = 0.0
+    z0: float = 0.0
+    name: str = "Joint"
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= float(self.dip_deg) < 89.9:
+            raise ValueError("WedgePlane3D dip_deg must lie in [0, 89.9) degrees.")
+
+    def z(self, x: Any, y: Any) -> np.ndarray:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        slope = float(np.tan(np.radians(self.dip_deg)))
+        az = float(np.radians(self.dip_dir_deg))
+        return self.z0 - slope * ((xa - self.x0) * np.cos(az) + (ya - self.y0) * np.sin(az))
+
+    def slope_xy(self) -> tuple[float, float]:
+        slope = float(np.tan(np.radians(self.dip_deg)))
+        az = float(np.radians(self.dip_dir_deg))
+        return -slope * float(np.cos(az)), -slope * float(np.sin(az))
+
+    def upward_normal(self) -> np.ndarray:
+        a = float(np.radians(self.dip_deg))
+        b = float(np.radians(self.dip_dir_deg))
+        return np.array([np.sin(a) * np.cos(b), np.sin(a) * np.sin(b), np.cos(a)], dtype=float)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dip_deg": float(self.dip_deg),
+            "dip_dir_deg": float(self.dip_dir_deg),
+            "x0": float(self.x0),
+            "y0": float(self.y0),
+            "z0": float(self.z0),
+            "name": self.name,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> WedgePlane3D:
+        return cls(
+            dip_deg=float(d["dip_deg"]),
+            dip_dir_deg=float(d["dip_dir_deg"]),
+            x0=float(d.get("x0", 0.0)),
+            y0=float(d.get("y0", 0.0)),
+            z0=float(d.get("z0", 0.0)),
+            name=str(d.get("name", "Joint")),
+        )
+
+
+@dataclass
+class MultiPlaneWedgeSurface(SlipSurface3D):
+    """3D rock wedge / fault-controlled slip surface formed by the upper envelope of >= 2 planes.
+
+    Evaluates ``z_b(x, y) = max_k z_k(x, y)`` inside ``bounds = (x_min, x_max, y_min, y_max)``
+    with exact piecewise-planar analytic gradients and kinematic intersection-line azimuth.
+    """
+
+    planes: list[WedgePlane3D]
+    bounds: tuple[float, float, float, float] = (-1.0e4, 1.0e4, -1.0e4, 1.0e4)
+
+    def __post_init__(self) -> None:
+        if len(self.planes) < 1:
+            raise ValueError("MultiPlaneWedgeSurface requires at least 1 WedgePlane3D.")
+
+    def z(self, x: Any, y: Any) -> np.ndarray:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        x0, x1, y0, y1 = self.bounds
+        inside = (xa >= x0) & (xa <= x1) & (ya >= y0) & (ya <= y1)
+        z_env = np.full(xa.shape, -np.inf, dtype=float)
+        for pl in self.planes:
+            z_env = np.maximum(z_env, pl.z(xa, ya))
+        return np.where(inside, z_env, np.nan)
+
+    def gradients(self, x: Any, y: Any, eps: float = 1e-5) -> tuple[np.ndarray, np.ndarray]:
+        del eps
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        x0, x1, y0, y1 = self.bounds
+        inside = (xa >= x0) & (xa <= x1) & (ya >= y0) & (ya <= y1)
+        z_best = np.full(xa.shape, -np.inf, dtype=float)
+        gx = np.full(xa.shape, np.nan, dtype=float)
+        gy = np.full(xa.shape, np.nan, dtype=float)
+        for pl in self.planes:
+            zp = pl.z(xa, ya)
+            sx, sy = pl.slope_xy()
+            win = zp > z_best
+            z_best = np.where(win, zp, z_best)
+            gx = np.where(win, sx, gx)
+            gy = np.where(win, sy, gy)
+        return np.where(inside, gx, np.nan), np.where(inside, gy, np.nan)
+
+    def kinematic_azimuth_deg(self) -> float:
+        """Downhill plunge azimuth [deg] of the primary two-plane intersection line (or single dip_dir)."""
+        if len(self.planes) == 1:
+            return float(self.planes[0].dip_dir_deg) % 360.0
+        n1 = self.planes[0].upward_normal()
+        n2 = self.planes[1].upward_normal()
+        line = np.cross(n1, n2)
+        horiz = float(np.hypot(line[0], line[1]))
+        if horiz < 1e-9:
+            return float(self.planes[0].dip_dir_deg) % 360.0
+        if line[2] > 0.0:
+            line = -line
+        elif abs(line[2]) <= 1e-12:
+            # Horizontal intersection line: orient along mean dip direction
+            d_mean = 0.5 * (n1[:2] + n2[:2])
+            if float(np.dot(line[:2], d_mean)) < 0.0:
+                line = -line
+        return float(np.degrees(np.arctan2(line[1], line[0])) % 360.0)
+
+    def intersection_plunge_deg(self) -> float:
+        """Plunge angle [deg] below horizontal of the primary two-plane intersection line."""
+        if len(self.planes) == 1:
+            return float(self.planes[0].dip_deg)
+        n1 = self.planes[0].upward_normal()
+        n2 = self.planes[1].upward_normal()
+        line = np.cross(n1, n2)
+        norm_l = float(np.linalg.norm(line))
+        if norm_l < 1e-12:
+            return float(self.planes[0].dip_deg)
+        if line[2] > 0.0:
+            line = -line
+        return float(np.degrees(np.arcsin(np.clip(-line[2] / norm_l, 0.0, 1.0))))
+
+    def footprint_bounds(self) -> tuple[float, float, float, float]:
+        return (
+            float(self.bounds[0]),
+            float(self.bounds[1]),
+            float(self.bounds[2]),
+            float(self.bounds[3]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "multi_plane_wedge",
+            "planes": [p.to_dict() for p in self.planes],
+            "bounds": [float(v) for v in self.bounds],
+        }
+
+
 def surface_from_dict(d: dict[str, Any]) -> SlipSurface3D:
     """Deserialize a SlipSurface3D instance from a dictionary."""
     kind = str(d.get("kind", "ellipsoid"))
@@ -369,6 +538,12 @@ def surface_from_dict(d: dict[str, Any]) -> SlipSurface3D:
         return SplinePatchSurface(
             base=surface_from_dict(d["base"]),  # type: ignore[arg-type]
             control_dz=np.asarray(d["control_dz"], dtype=float),
+        )
+    if kind == "multi_plane_wedge":
+        b_raw = d.get("bounds", [-1.0e4, 1.0e4, -1.0e4, 1.0e4])
+        return MultiPlaneWedgeSurface(
+            planes=[WedgePlane3D.from_dict(p) for p in d["planes"]],
+            bounds=(float(b_raw[0]), float(b_raw[1]), float(b_raw[2]), float(b_raw[3])),
         )
     if kind == "mesh":
         return MeshSlipSurface(vertices=np.asarray(d["vertices"], dtype=float))

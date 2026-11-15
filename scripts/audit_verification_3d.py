@@ -37,6 +37,7 @@ from slipsurface3d.project import (  # noqa: E402
     SurfaceConfig3D,
     extruded_acads_1a_project,
     hungr_1987_hemisphere_project,
+    rock_wedge_3d_project,
     zhang_1988_homog_ellipsoid_project,
     zhang_1988_weak_seam_project,
 )
@@ -91,7 +92,15 @@ def main() -> int:
     p_c1.surface_config.mode = "user"
     p_c1.surface_config.user_surface = cylindrical_surface(20.0, 16.0, 17.0, y_center=5.0).to_dict()
     p_c1.y_min, p_c1.y_max = 0.0, 10.0
-    p_c1.analysis.methods = ["ordinary", "bishop", "janbu_simplified", "janbu_corrected", "spencer"]
+    p_c1.analysis.methods = [
+        "ordinary",
+        "bishop",
+        "janbu_simplified",
+        "janbu_corrected",
+        "spencer",
+        "gle_mp",
+        "cheng_yip",
+    ]
     p_c1.analysis.nx, p_c1.analysis.ny = 80, 1
 
     p_c2 = p_c1.copy()
@@ -199,6 +208,21 @@ def main() -> int:
     )
     if st_sym == "FAIL":
         failures.append(f"Azimuth symmetry diff={sym_diff}")
+
+    # 6. Hoek & Bray (1981) Analytical 3D Rock Wedge Benchmark
+    p_wedge = rock_wedge_3d_project()
+    r_wedge = run_analysis_3d(p_wedge)
+    exact_wedge = math.tan(math.radians(38.0)) / (
+        math.tan(math.radians(30.0)) * math.cos(math.radians(35.0))
+    )
+    f_wedge = r_wedge.method_results["spencer"].fos
+    err_wedge = abs(f_wedge - exact_wedge) / exact_wedge
+    st_wedge = "PASS" if err_wedge < 1e-6 else "FAIL"
+    print(
+        f"[6] Hoek & Bray (1981) 3D Rock Wedge        : 3D Spencer={f_wedge:.6f} | Exact={exact_wedge:.6f} | RelErr={err_wedge * 100:.4f}% [{st_wedge}]"
+    )
+    if st_wedge == "FAIL":
+        failures.append(f"Hoek & Bray 3D wedge rel_err={err_wedge}")
 
     print("=" * 78)
     if failures:

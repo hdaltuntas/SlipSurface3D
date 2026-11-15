@@ -10,9 +10,12 @@ from slipsurface3d.ui.dialogs import (
     AnalysisSurfaceDialog,
     BoreholesDialog,
     ColumnDataDialog,
+    CrossSectionComparisonDialog,
     LoadsSupports3DDialog,
     Materials3DDialog,
     ParametricSlopeDialog,
+    ProbabilisticSensitivity3DDialog,
+    SeismicNewmark3DDialog,
 )
 from slipsurface3d.ui.main_window import MainWindow3D
 from slipsurface3d.ui.preferences import apply_theme
@@ -35,7 +38,8 @@ def test_main_window_3d_compute_views_undo_and_exports(qapp, tmp_path: Path):
 
     win.viewport.set_scalar_field("TauMob_kPa")
     win.viewport.set_camera_view("xy")
-    win.viewport.set_layer_visibility(clip_mid_y=True)
+    win.viewport.set_layer_visibility(clip_mid_y=True, safety_map=True, force_vectors=True)
+    win.viewport.preview_trial_surface(win.results.critical_surface)
     win.toggle_theme()
     apply_theme(qapp, "dark")
 
@@ -109,6 +113,26 @@ def test_dialogs_construct_and_apply_cleanly(qapp):
     d_col = ColumnDataDialog(win.results, "bishop", win)
     assert d_col.table.rowCount() == win.results.columns.n
     d_col.close()
+
+    # Advanced Stage 3D-4 Dialogs (Probabilistic, Seismic ky/Newmark, 2D Cross-Section)
+    d_prob = ProbabilisticSensitivity3DDialog(win.project, win.results, win)
+    d_prob.samples_sp.setValue(24)
+    d_prob.execute_probabilistic()
+    assert "Mean FoS" in d_prob.summary_lbl.text()
+    d_prob.execute_sensitivity()
+    assert d_prob.table.rowCount() >= 2
+    d_prob.close()
+
+    d_seis = SeismicNewmark3DDialog(win.project, win.results, win)
+    d_seis.execute_seismic()
+    assert "Critical Yield Acceleration" in d_seis.out_lbl.text()
+    d_seis.close()
+
+    d_sec = CrossSectionComparisonDialog(win.project, win.results, win)
+    d_sec.evaluate_section()
+    assert d_sec.table.rowCount() >= 1
+    d_sec.close()
+
     win.close()
 
 

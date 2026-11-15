@@ -28,3 +28,12 @@ When any 2D slope profile and circular slip surface (`ry -> infinity`) are extru
 ## 4. Coordinate-Frame & Azimuth Invariance
 
 Rotating a 3D slope and spherical slip surface by $90^\circ$ in the horizontal $(X, Y)$ plane yields automatic sliding-direction detection (`180.0°` vs `270.0°`) and identical Factors of Safety (`|ΔFoS| < 1e-12`) for both 3D Bishop and 3D Spencer.
+
+
+## 5. Hoek & Bray (1981) Closed-Form 3D Rock Wedge Benchmark
+
+For a symmetric two-plane rock wedge with line-of-intersection plunge $\psi_i = 30^\circ$, dihedral plane tilt $\beta = 35^\circ$ (half-wedge angle $\xi = 55^\circ$), cohesion $c' = 0$, and joint friction angle $\phi' = 38^\circ$:
+
+$$F_{\text{3D, Hoek-Bray}} = \frac{\tan\phi'}{\tan\psi_i \sin\xi} = \frac{\tan 38^\circ}{\tan 30^\circ \cos 35^\circ} = 1.651984$$
+
+- **SlipSurfaceIQ-3D (`MultiPlaneWedgeSurface`)**: Janbu Simplified, Spencer, GLE/M-P, and Cheng & Yip all yield **`1.651984`** (`|ΔFoS| < 1e-10`), reproducing exact 3D lateral wedging amplification ($1/\cos 35^\circ = 1.2208\times$ over 2D planar sliding).

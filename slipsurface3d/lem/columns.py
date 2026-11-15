@@ -8,12 +8,13 @@ loads, external surface/point loads, and 3D reinforcement intersections.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
 import pyvista as pv
 
-from slipsurface3d.geometry.surfaces import SlipSurface3D
+from slipsurface3d.geometry.surfaces import MultiPlaneWedgeSurface, SlipSurface3D
 from slipsurface3d.geometry.terrain import SlopeModel3D
 from slipsurface3d.loads.supports import LoadSet3D
 from slipsurface3d.materials.models import Material3D
@@ -40,6 +41,7 @@ class ColumnOptions:
     min_depth: float = 0.05
     min_columns: int = 6
     loads: LoadSet3D | None = None
+    pore_pressure_fn: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray] | None = None
 
 
 @dataclass
@@ -106,20 +108,121 @@ class ColumnGrid:
     material_colors: list[str]
     surface: SlipSurface3D
 
-    # Seismic & external loads in sliding frame (+s downhill, +z upward)
+    # Seismic & external loads in sliding frame (+s downhill, +t transverse, +z upward)
     kh: float = 0.0
     kv: float = 0.0
     Qs_active: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    Qt_active: np.ndarray = field(default_factory=lambda: np.zeros(0))
     Qz_active: np.ndarray = field(default_factory=lambda: np.zeros(0))
     Ms_active: np.ndarray = field(
         default_factory=lambda: np.zeros(0)
     )  # CCW driving moment about (sc, zc)
     Qs_passive: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    Qt_passive: np.ndarray = field(default_factory=lambda: np.zeros(0))
     Qz_passive: np.ndarray = field(default_factory=lambda: np.zeros(0))
     Ms_passive: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    Fx_active: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    Fy_active: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    Fx_passive: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    Fy_passive: np.ndarray = field(default_factory=lambda: np.zeros(0))
     crack_water_force_s: float = 0.0
     crack_water_moment: float = 0.0
     support_hits: list[SupportHit3D] = field(default_factory=list)
+
+    def reproject_azimuth(self, new_azimuth_deg: float) -> ColumnGrid:
+        """Re-orient sliding-frame projections ``(s, t, alpha_s, ns, nt, Qs, Qt, Ms)`` to ``new_azimuth_deg``."""
+        az = float(new_azimuth_deg) % 360.0
+        psi = float(np.radians(az))
+        sx, sy = float(np.cos(psi)), float(np.sin(psi))
+        tx, ty = -sy, sx
+
+        s = self.x * sx + self.y * sy
+        t = self.x * tx + self.y * ty
+        tan_as = -(self.dz_dx * sx + self.dz_dy * sy)
+        tan_at = -(self.dz_dx * tx + self.dz_dy * ty)
+        alpha_s = np.arctan(tan_as)
+        sin_as = np.sin(alpha_s)
+        cos_as = np.cos(alpha_s)
+        ns = tan_as / self.jacobian
+        nt = tan_at / self.jacobian
+
+        rot = self.surface.rotation_center_sz(az)
+        if rot is not None:
+            sc, zc = rot
+        else:
+            sc = float(0.5 * (np.min(s) + np.max(s)))
+            zc = float(np.max(self.z_top) + 0.6 * max(1.0, float(np.max(s) - np.min(s))))
+
+        fx_a = self.Fx_active if len(self.Fx_active) == self.n else np.zeros(self.n)
+        fy_a = self.Fy_active if len(self.Fy_active) == self.n else np.zeros(self.n)
+        fx_p = self.Fx_passive if len(self.Fx_passive) == self.n else np.zeros(self.n)
+        fy_p = self.Fy_passive if len(self.Fy_passive) == self.n else np.zeros(self.n)
+
+        qs_a = fx_a * sx + fy_a * sy
+        qt_a = fx_a * tx + fy_a * ty
+        qs_p = fx_p * sx + fy_p * sy
+        qt_p = fx_p * tx + fy_p * ty
+        ms_a = (s - sc) * self.Qz_active - (self.z_top - zc) * qs_a
+        ms_p = (s - sc) * self.Qz_passive - (self.z_base - zc) * qs_p
+
+        return ColumnGrid(
+            ix=self.ix,
+            iy=self.iy,
+            nx_grid=self.nx_grid,
+            ny_grid=self.ny_grid,
+            dx=self.dx,
+            dy=self.dy,
+            x=self.x,
+            y=self.y,
+            z_base=self.z_base,
+            z_top=self.z_top,
+            z_cg=self.z_cg,
+            h=self.h,
+            dA=self.dA,
+            area_base=self.area_base,
+            azimuth_deg=az,
+            s=s,
+            t=t,
+            sc=sc,
+            zc=zc,
+            dz_dx=self.dz_dx,
+            dz_dy=self.dz_dy,
+            tan_alpha_s=tan_as,
+            tan_alpha_t=tan_at,
+            alpha_s=alpha_s,
+            sin_alpha_s=sin_as,
+            cos_alpha_s=cos_as,
+            jacobian=self.jacobian,
+            ns=ns,
+            nt=nt,
+            nz=self.nz,
+            normal_xyz=self.normal_xyz,
+            W=self.W,
+            u=self.u,
+            u_excess=self.u_excess,
+            sigma_v_eff=self.sigma_v_eff,
+            mat_idx=self.mat_idx,
+            materials=self.materials,
+            material_colors=self.material_colors,
+            surface=self.surface,
+            kh=self.kh,
+            kv=self.kv,
+            Qs_active=qs_a,
+            Qt_active=qt_a,
+            Qz_active=self.Qz_active,
+            Ms_active=ms_a,
+            Qs_passive=qs_p,
+            Qt_passive=qt_p,
+            Qz_passive=self.Qz_passive,
+            Ms_passive=ms_p,
+            Fx_active=fx_a,
+            Fy_active=fy_a,
+            Fx_passive=fx_p,
+            Fy_passive=fy_p,
+            crack_water_force_s=self.crack_water_force_s,
+            crack_water_moment=self.crack_water_moment,
+            support_hits=self.support_hits,
+        )
 
     @property
     def n(self) -> int:
@@ -411,6 +514,8 @@ def discretize_columns(
         az_deg = 0.0
     elif opts.sliding_mode == "custom":
         az_deg = float(opts.azimuth_deg) % 360.0
+    elif isinstance(surface, MultiPlaneWedgeSurface) and len(surface.planes) >= 2:
+        az_deg = surface.kinematic_azimuth_deg()
     else:
         # Auto: area/height-weighted downhill basal gradient -sum(h * grad(z_b))
         w_tmp = h_grid[active_mask]
@@ -503,9 +608,7 @@ def discretize_columns(
     n_sub = max(4, int(opts.n_sub))
     fracs = (np.arange(n_sub) + 0.5) / n_sub
     z_samples = zb[:, None] + h[:, None] * fracs[None, :]  # (n_cols, n_sub)
-    x_samples = np.broadcast_to(x[:, None], (n_cols, n_sub))
-    y_samples = np.broadcast_to(y[:, None], (n_cols, n_sub))
-    mat_sub = model.material_indices_at(x_samples, y_samples, z_samples, mat_names)
+    mat_sub = model.material_indices_columns(x, y, z_samples, mat_names)
 
     # Basal material index (just inside the column above z_base)
     mat_idx = model.material_indices_at(x, y, zb + np.minimum(1e-4, 0.02 * h), mat_names)
@@ -555,11 +658,17 @@ def discretize_columns(
 
     # External patch loads & point loads
     Qs_a = np.zeros(n_cols, dtype=float)
+    Qt_a = np.zeros(n_cols, dtype=float)
     Qz_a = np.zeros(n_cols, dtype=float)
     Ms_a = np.zeros(n_cols, dtype=float)
     Qs_p = np.zeros(n_cols, dtype=float)
+    Qt_p = np.zeros(n_cols, dtype=float)
     Qz_p = np.zeros(n_cols, dtype=float)
     Ms_p = np.zeros(n_cols, dtype=float)
+    Fx_a = np.zeros(n_cols, dtype=float)
+    Fy_a = np.zeros(n_cols, dtype=float)
+    Fx_p = np.zeros(n_cols, dtype=float)
+    Fy_p = np.zeros(n_cols, dtype=float)
     surcharge_qz_down = np.zeros(n_cols, dtype=float)
 
     if opts.loads is not None:
@@ -569,9 +678,15 @@ def discretize_columns(
                 continue
             uvec = pl.unit_direction_xyz()
             f_mag = q_val * dA  # [kN]
-            fs = f_mag * (uvec[0] * sx + uvec[1] * sy)
+            fx_pl = f_mag * uvec[0]
+            fy_pl = f_mag * uvec[1]
+            fs = fx_pl * sx + fy_pl * sy
+            ft = fx_pl * tx + fy_pl * ty
             fz = f_mag * uvec[2]  # negative for downward load
+            Fx_a += fx_pl
+            Fy_a += fy_pl
             Qs_a += fs
+            Qt_a += ft
             Qz_a += fz
             # CCW driving torque about (sc, zc) applied at ground surface (s_i, z_top_i):
             # tau_ccw = (s_i - s_c) * F_z - (z_app - z_c) * F_s
@@ -585,15 +700,26 @@ def discretize_columns(
             if dist2[k_near] <= (max(dx, dy) * 2.0) ** 2 or n_cols > 0:
                 fxyz = ptl.force_xyz()
                 fs_pt = float(fxyz[0] * sx + fxyz[1] * sy)
+                ft_pt = float(fxyz[0] * tx + fxyz[1] * ty)
                 fz_pt = float(fxyz[2])
                 sp_pt = ptl.x * sx + ptl.y * sy
+                Fx_a[k_near] += float(fxyz[0])
+                Fy_a[k_near] += float(fxyz[1])
                 Qs_a[k_near] += fs_pt
+                Qt_a[k_near] += ft_pt
                 Qz_a[k_near] += fz_pt
                 Ms_a[k_near] += (sp_pt - sc) * fz_pt - (ptl.z - zc) * fs_pt
 
     # Basal pore-water pressure u [kPa]
     u_base = np.zeros(n_cols, dtype=float)
-    if opts.pore_mode == "water_table" and z_wt is not None:
+    if opts.pore_pressure_fn is not None and opts.pore_mode in (
+        "seepage",
+        "seepage_grid",
+        "water_table",
+    ):
+        u_eval = np.maximum(np.asarray(opts.pore_pressure_fn(x, y, zb), dtype=float), 0.0)
+        u_base = np.where(use_water[mat_idx], hu_arr[mat_idx] * u_eval, 0.0)
+    elif opts.pore_mode == "water_table" and z_wt is not None:
         head = np.maximum(z_wt - zb, 0.0)
         u_base = np.where(use_water[mat_idx], hu_arr[mat_idx] * opts.gamma_w * head, 0.0)
     elif opts.pore_mode == "ru":
@@ -629,17 +755,24 @@ def discretize_columns(
                 f_xyz = f_xyz_raw
 
             fs_b = float(f_xyz[0] * sx + fxyz_s_helper(f_xyz, sy))
+            ft_b = float(f_xyz[0] * tx + f_xyz[1] * ty)
             fz_b = float(f_xyz[2])
             s_hit = float(hit_xyz[0] * sx + hit_xyz[1] * sy)
             z_hit = float(hit_xyz[2])
             mom_b = (s_hit - sc) * fz_b - (z_hit - zc) * fs_b
 
             if bolt.support_type.application == "passive":
+                Fx_p[k_col] += float(f_xyz[0])
+                Fy_p[k_col] += float(f_xyz[1])
                 Qs_p[k_col] += fs_b
+                Qt_p[k_col] += ft_b
                 Qz_p[k_col] += fz_b
                 Ms_p[k_col] += mom_b
             else:
+                Fx_a[k_col] += float(f_xyz[0])
+                Fy_a[k_col] += float(f_xyz[1])
                 Qs_a[k_col] += fs_b
+                Qt_a[k_col] += ft_b
                 Qz_a[k_col] += fz_b
                 Ms_a[k_col] += mom_b
 
@@ -698,11 +831,17 @@ def discretize_columns(
         kh=opts.kh,
         kv=opts.kv,
         Qs_active=Qs_a,
+        Qt_active=Qt_a,
         Qz_active=Qz_a,
         Ms_active=Ms_a,
         Qs_passive=Qs_p,
+        Qt_passive=Qt_p,
         Qz_passive=Qz_p,
         Ms_passive=Ms_p,
+        Fx_active=Fx_a,
+        Fy_active=Fy_a,
+        Fx_passive=Fx_p,
+        Fy_passive=Fy_p,
         crack_water_force_s=crack_force_s,
         crack_water_moment=crack_moment,
         support_hits=support_hits,

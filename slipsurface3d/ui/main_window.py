@@ -39,10 +39,16 @@ from slipsurface3d import APP_NAME, __version__
 from slipsurface3d.analysis import AnalysisResults3D, report_text_3d, run_analysis_3d
 from slipsurface3d.exchange import (
     export_dxf_3d,
+    export_esri_ascii_dem,
     export_obj_mesh,
+    export_stl_mesh,
     import_dxf_3d_vertices,
+    import_esri_ascii_dem,
     import_obj_horizon,
     import_obj_slip_surface,
+    import_stl_horizon,
+    import_stl_slip_surface,
+    import_xyz_csv_horizon,
 )
 from slipsurface3d.geometry.terrain import HorizonSurface
 from slipsurface3d.lem.solvers import METHODS_3D
@@ -57,10 +63,13 @@ from slipsurface3d.ui.dialogs import (
     AnalysisSurfaceDialog,
     BoreholesDialog,
     ColumnDataDialog,
+    CrossSectionComparisonDialog,
     Import2DExtrusionDialog,
     LoadsSupports3DDialog,
     Materials3DDialog,
     ParametricSlopeDialog,
+    ProbabilisticSensitivity3DDialog,
+    SeismicNewmark3DDialog,
 )
 from slipsurface3d.ui.preferences import apply_theme, current_theme, push_recent_file
 from slipsurface3d.ui.viewport3d import SCALAR_FIELD_OPTIONS, Viewport3D
@@ -68,18 +77,25 @@ from slipsurface3d.ui.viewport3d import SCALAR_FIELD_OPTIONS, Viewport3D
 
 class _ComputeWorker3D(QThread):
     progress = Signal(int, int, float)
+    best_surface = Signal(object, float)
     finished_ok = Signal(object)
     failed = Signal(str)
 
     def __init__(self, project: Project3D, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._project = project.copy()
+        self._cancelled = False
+
+    def request_cancel(self) -> None:
+        self._cancelled = True
 
     def run(self) -> None:
         try:
             res = run_analysis_3d(
                 self._project,
                 progress_cb=lambda g, n, f: self.progress.emit(g, n, f),
+                best_surface_cb=lambda s, f: self.best_surface.emit(s, f),
+                cancel_check=lambda: self._cancelled,
             )
             self.finished_ok.emit(res)
         except Exception as exc:
@@ -168,7 +184,7 @@ class MainWindow3D(QMainWindow):
         file_m.addAction(self.act_save_as)
 
         file_m.addSeparator()
-        cad_m = file_m.addMenu("3D CAD / Mesh Exchange (DXF / OBJ)")
+        cad_m = file_m.addMenu("3D CAD / GIS / Mesh Exchange")
         act_exp_dxf = QAction("Export 3D DXF (3DFACE)...", self)
         act_exp_dxf.triggered.connect(self.export_dxf_dialog)
         cad_m.addAction(act_exp_dxf)
@@ -177,11 +193,20 @@ class MainWindow3D(QMainWindow):
         act_exp_obj.triggered.connect(self.export_obj_dialog)
         cad_m.addAction(act_exp_obj)
 
-        act_imp_terr = QAction("Import Terrain Horizon from DXF/OBJ...", self)
+        act_exp_stl = QAction("Export Binary STL Mesh...", self)
+        act_exp_stl.triggered.connect(self.export_stl_dialog)
+        cad_m.addAction(act_exp_stl)
+
+        act_exp_dem = QAction("Export Ground ESRI ASCII DEM (.asc)...", self)
+        act_exp_dem.triggered.connect(self.export_dem_dialog)
+        cad_m.addAction(act_exp_dem)
+
+        cad_m.addSeparator()
+        act_imp_terr = QAction("Import Terrain Horizon (DXF / OBJ / STL / DEM / CSV)...", self)
         act_imp_terr.triggered.connect(self.import_terrain_mesh_dialog)
         cad_m.addAction(act_imp_terr)
 
-        act_imp_slip = QAction("Import User 3D Slip Surface from OBJ...", self)
+        act_imp_slip = QAction("Import User 3D Slip Surface (OBJ / STL)...", self)
         act_imp_slip.triggered.connect(self.import_slip_obj_dialog)
         cad_m.addAction(act_imp_slip)
 
@@ -240,9 +265,30 @@ class MainWindow3D(QMainWindow):
         self.act_compute.triggered.connect(self.compute_analysis)
         an_m.addAction(self.act_compute)
 
+        self.act_cancel = QAction("Stop Search", self)
+        self.act_cancel.setEnabled(False)
+        ic_stop = _safe_icon("fa5s.stop", "#ef4444")
+        if ic_stop is not None:
+            self.act_cancel.setIcon(ic_stop)
+        self.act_cancel.triggered.connect(self.cancel_analysis)
+        an_m.addAction(self.act_cancel)
+
         self.act_col_table = QAction("Inspect 3D Column Table...", self)
         self.act_col_table.triggered.connect(self.open_column_table)
         an_m.addAction(self.act_col_table)
+
+        an_m.addSeparator()
+        self.act_prob = QAction("Probabilistic & Tornado Sensitivity...", self)
+        self.act_prob.triggered.connect(self.open_probabilistic_dialog)
+        an_m.addAction(self.act_prob)
+
+        self.act_seismic = QAction("Seismic ky & Newmark Displacement...", self)
+        self.act_seismic.triggered.connect(self.open_seismic_dialog)
+        an_m.addAction(self.act_seismic)
+
+        self.act_section2d = QAction("2D Cross-Section & F3D/F2D Comparison...", self)
+        self.act_section2d.triggered.connect(self.open_cross_section_dialog)
+        an_m.addAction(self.act_section2d)
 
         # View Menu
         view_m = mb.addMenu("&View")
@@ -294,6 +340,12 @@ class MainWindow3D(QMainWindow):
         tb.addAction(self.act_settings)
         tb.addSeparator()
         tb.addAction(self.act_compute)
+        tb.addAction(self.act_cancel)
+        tb.addSeparator()
+        tb.addAction(self.act_prob)
+        tb.addAction(self.act_seismic)
+        tb.addAction(self.act_section2d)
+        tb.addSeparator()
         tb.addAction(self.act_pdf)
 
     def _build_docks(self) -> None:
@@ -352,6 +404,20 @@ class MainWindow3D(QMainWindow):
         self.chk_clip.setChecked(False)
         self.chk_clip.toggled.connect(lambda v: self.viewport.set_layer_visibility(clip_mid_y=v))
         fvis.addRow("", self.chk_clip)
+
+        self.chk_safety_map = QCheckBox("Show 3D Slope Safety Map")
+        self.chk_safety_map.setChecked(False)
+        self.chk_safety_map.toggled.connect(
+            lambda v: self.viewport.set_layer_visibility(safety_map=v)
+        )
+        fvis.addRow("", self.chk_safety_map)
+
+        self.chk_forces = QCheckBox("Show Picked Column 3D Force Arrows")
+        self.chk_forces.setChecked(True)
+        self.chk_forces.toggled.connect(
+            lambda v: self.viewport.set_layer_visibility(force_vectors=v)
+        )
+        fvis.addRow("", self.chk_forces)
 
         vc.addWidget(vis_box)
 
@@ -660,16 +726,28 @@ class MainWindow3D(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             return
         self.act_compute.setEnabled(False)
+        self.act_cancel.setEnabled(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.statusBar().showMessage("Computing 3D Limit Equilibrium analysis...")
 
         worker = _ComputeWorker3D(self.project, self)
         worker.progress.connect(self._on_worker_progress)
+        worker.best_surface.connect(self._on_worker_best_surface)
         worker.finished_ok.connect(self._on_worker_done)
         worker.failed.connect(self._on_worker_failed)
         self._worker = worker
         worker.start()
+
+    def cancel_analysis(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.request_cancel()
+            self.statusBar().showMessage("Stopping 3D search after current evaluation...")
+
+    def _on_worker_best_surface(self, surf_obj: Any, best_fos: float) -> None:
+        if self.results is None:
+            self.viewport.preview_trial_surface(surf_obj)
+            self.statusBar().showMessage(f"Live 3D search best trial FoS = {best_fos:.4f}")
 
     def _on_worker_progress(self, gen: int, total: int, best_fos: float) -> None:
         self.progress_bar.setRange(0, total)
@@ -681,18 +759,22 @@ class MainWindow3D(QMainWindow):
 
     def _on_worker_done(self, res_obj: Any) -> None:
         self.act_compute.setEnabled(True)
+        self.act_cancel.setEnabled(False)
         self.progress_bar.setVisible(False)
         self.results = res_obj
         self._refresh_all(reset_camera=False)
         assert self.results is not None
+        tag = " (Stopped early)" if self.results.cancelled else ""
         self.statusBar().showMessage(
-            f"3D Analysis complete in {self.results.elapsed_s:.2f} s — "
+            f"3D Analysis complete{tag} in {self.results.elapsed_s:.2f} s — "
             f"Critical FoS = {self.results.critical_fos:.4f}"
         )
 
     def _on_worker_failed(self, err_msg: str) -> None:
         self.act_compute.setEnabled(True)
+        self.act_cancel.setEnabled(False)
         self.progress_bar.setVisible(False)
+        self.viewport.preview_trial_surface(None)
         self.statusBar().showMessage("3D Analysis failed.")
         QMessageBox.critical(self, "3D Analysis Error", err_msg)
 
@@ -702,6 +784,18 @@ class MainWindow3D(QMainWindow):
             return
         meth = str(self.method_combo.currentData() or self.results.primary_method)
         dlg = ColumnDataDialog(self.results, meth, self)
+        dlg.exec()
+
+    def open_probabilistic_dialog(self) -> None:
+        dlg = ProbabilisticSensitivity3DDialog(self.project, self.results, self)
+        dlg.exec()
+
+    def open_seismic_dialog(self) -> None:
+        dlg = SeismicNewmark3DDialog(self.project, self.results, self)
+        dlg.exec()
+
+    def open_cross_section_dialog(self) -> None:
+        dlg = CrossSectionComparisonDialog(self.project, self.results, self)
         dlg.exec()
 
     # ------------------------------------------------------- Exports / Imports
@@ -742,27 +836,76 @@ class MainWindow3D(QMainWindow):
         export_obj_mesh(fn, meshes)
         self.statusBar().showMessage(f"Exported OBJ mesh to {fn}")
 
+    def export_stl_dialog(self) -> None:
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "Export Binary STL", "slope_3d.stl", "STL Files (*.stl)"
+        )
+        if not fn:
+            return
+        model = self.results.model if self.results is not None else self.project.build_model()
+        meshes: list[tuple[str, Any]] = [("Ground_3D", model.ground_mesh())]
+        if self.results is not None:
+            meshes.append(
+                (
+                    "Critical_Slip_3D",
+                    self.results.critical_surface.to_mesh(
+                        model.x_bounds, model.y_bounds, ground_fn=model.ground_z
+                    ),
+                )
+            )
+        export_stl_mesh(fn, meshes, binary=True)
+        self.statusBar().showMessage(f"Exported Binary STL mesh to {fn}")
+
+    def export_dem_dialog(self) -> None:
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "Export ESRI ASCII DEM", "terrain.asc", "ESRI ASCII Grid (*.asc)"
+        )
+        if not fn:
+            return
+        model = self.results.model if self.results is not None else self.project.build_model()
+        export_esri_ascii_dem(fn, model.ground, model.x_bounds, model.y_bounds, cellsize=1.0)
+        self.statusBar().showMessage(f"Exported ESRI ASCII DEM to {fn}")
+
     def import_terrain_mesh_dialog(self) -> None:
         fn, _ = QFileDialog.getOpenFileName(
-            self, "Import 3D Terrain Mesh", "", "3D Mesh / CAD (*.obj *.dxf)"
+            self,
+            "Import 3D Terrain Horizon",
+            "",
+            "3D Terrain / GIS (*.obj *.dxf *.stl *.asc *.csv *.xyz)",
         )
         if not fn:
             return
         try:
             p = Path(fn)
-            if p.suffix.lower() == ".obj":
+            ext = p.suffix.lower()
+            if ext == ".obj":
                 hor = import_obj_horizon(p, name=p.stem)
-                pts = hor.points
+            elif ext == ".stl":
+                hor = import_stl_horizon(p, name=p.stem)
+            elif ext == ".asc":
+                hor = import_esri_ascii_dem(p, name=p.stem)
+            elif ext in (".csv", ".xyz"):
+                hor = import_xyz_csv_horizon(p, name=p.stem)
             else:
                 pts = import_dxf_3d_vertices(p)
                 hor = HorizonSurface.from_scattered(pts, name=p.stem)
-            assert pts is not None
+
+            if hor.x_coords is not None and hor.y_coords is not None and hor.z_grid is not None:
+                x0, x1 = float(hor.x_coords[0]), float(hor.x_coords[-1])
+                y0, y1 = float(hor.y_coords[0]), float(hor.y_coords[-1])
+                zmin = float(np.min(hor.z_grid)) - 10.0
+            else:
+                assert hor.points is not None
+                x0, x1 = float(np.min(hor.points[:, 0])), float(np.max(hor.points[:, 0]))
+                y0, y1 = float(np.min(hor.points[:, 1])), float(np.max(hor.points[:, 1]))
+                zmin = float(np.min(hor.points[:, 2])) - 10.0
+
             self._push_undo()
-            self.project.x_min = float(np.min(pts[:, 0]))
-            self.project.x_max = float(np.max(pts[:, 0]))
-            self.project.y_min = float(np.min(pts[:, 1]))
-            self.project.y_max = float(np.max(pts[:, 1]))
-            self.project.z_min = float(np.min(pts[:, 2])) - 10.0
+            self.project.x_min = x0
+            self.project.x_max = x1
+            self.project.y_min = y0
+            self.project.y_max = y1
+            self.project.z_min = zmin
             self.project.ground = hor
             self.project.layers = [(self.project.materials[0].name, hor)]
             self.project.profile_regions = []
@@ -773,12 +916,20 @@ class MainWindow3D(QMainWindow):
 
     def import_slip_obj_dialog(self) -> None:
         fn, _ = QFileDialog.getOpenFileName(
-            self, "Import User 3D Slip Surface (.obj)", "", "OBJ Files (*.obj)"
+            self,
+            "Import User 3D Slip Surface",
+            "",
+            "3D Mesh Files (*.obj *.stl)",
         )
         if not fn:
             return
         try:
-            surf = import_obj_slip_surface(fn)
+            p = Path(fn)
+            surf = (
+                import_stl_slip_surface(p)
+                if p.suffix.lower() == ".stl"
+                else import_obj_slip_surface(p)
+            )
             self._push_undo()
             self.project.surface_config.mode = "user"
             self.project.surface_config.user_surface = surf.to_dict()

@@ -16,7 +16,9 @@ import numpy as np
 from slipsurface3d.geometry.surfaces import (
     CompositeEllipsoidPlaneSurface,
     EllipsoidSurface,
+    MultiPlaneWedgeSurface,
     SlipSurface3D,
+    WedgePlane3D,
     cylindrical_surface,
     sphere_surface,
     surface_from_dict,
@@ -31,7 +33,7 @@ from slipsurface3d.geometry.terrain import (
     simple_3d_slope,
 )
 from slipsurface3d.lem.columns import GAMMA_W, ColumnOptions
-from slipsurface3d.lem.solvers import M_ALPHA_MIN_DEFAULT, METHODS_3D
+from slipsurface3d.lem.solvers import INTERCOLUMN_FUNCTIONS, M_ALPHA_MIN_DEFAULT, METHODS_3D
 from slipsurface3d.loads.supports import (
     Bolt3D,
     LoadSet3D,
@@ -42,6 +44,7 @@ from slipsurface3d.loads.supports import (
 )
 from slipsurface3d.materials.models import MODEL_LABELS, Material3D, material_from_spec_dict
 from slipsurface3d.optimizer.search import EFFORT_PRESETS, SearchSettings3D
+from slipsurface3d.seepage import SeepageBC3D, solve_seepage_3d
 
 FORMAT_3D = "slipsurface-3d"
 VERSION_3D = 1
@@ -178,15 +181,18 @@ class AnalysisSettings3D:
     min_depth: float = 0.1
     m_alpha_min: float = M_ALPHA_MIN_DEFAULT
     check_admissibility: bool = True
+    gle_interslice: str = "half-sine"
+    n_workers: int = 1
 
 
 @dataclass
 class SurfaceConfig3D:
     mode: str = "search"  # search | user
-    surface_kind: str = "ellipsoid"  # sphere | ellipsoid | spline_patch
+    surface_kind: str = "ellipsoid"  # sphere | ellipsoid | spline_patch | wedge
     effort: str = "normal"  # fast | normal | fine
     primary_method: str = "bishop"
     optimize_azimuth: bool = False
+    sao_enabled: bool = False
     seed: int = 42
     user_surface: dict[str, Any] | None = None
     y_center_range: list[float] | None = None
@@ -214,6 +220,7 @@ class Project3D:
         default_factory=list
     )  # [{head:[x,y,z], tip:[x,y,z], type:name, label}]
     tension_crack: TensionCrack3D | None = None
+    seepage_bc: SeepageBC3D | None = None
     analysis: AnalysisSettings3D = field(default_factory=AnalysisSettings3D)
     surface_config: SurfaceConfig3D = field(default_factory=SurfaceConfig3D)
 
@@ -271,7 +278,7 @@ class Project3D:
             raise ValueError("Column grid requires nx >= 3, ny >= 1, n_sub >= 4.")
         if a.tolerance <= 0 or a.max_iter < 1:
             raise ValueError("Solver tolerance > 0 and max_iter >= 1 required.")
-        if a.pore_mode not in ("water_table", "ru", "none"):
+        if a.pore_mode not in ("water_table", "ru", "seepage", "none"):
             raise ValueError(f"Unknown pore_mode: {a.pore_mode!r}.")
         if a.gamma_w <= 0 or not 0.0 <= a.ru <= 1.0:
             raise ValueError("Require gamma_w > 0 and 0 <= ru <= 1.")
@@ -279,11 +286,15 @@ class Project3D:
             raise ValueError("Require kh >= 0 and -1 < kv < 1.")
         if a.sliding_mode not in ("auto", "right_to_left", "left_to_right", "custom"):
             raise ValueError(f"Unknown sliding_mode: {a.sliding_mode!r}.")
+        if a.gle_interslice not in INTERCOLUMN_FUNCTIONS:
+            raise ValueError(f"Unknown gle_interslice: {a.gle_interslice!r}.")
+        if a.n_workers < 0:
+            raise ValueError("Require n_workers >= 0.")
 
         sc = self.surface_config
         if sc.mode not in ("search", "user"):
             raise ValueError("surface_config.mode must be 'search' or 'user'.")
-        if sc.surface_kind not in ("sphere", "ellipsoid", "spline_patch"):
+        if sc.surface_kind not in ("sphere", "ellipsoid", "spline_patch", "wedge"):
             raise ValueError(f"Unknown surface_kind: {sc.surface_kind!r}.")
         if sc.effort not in EFFORT_PRESETS:
             raise ValueError(f"Unknown search effort: {sc.effort!r}.")
@@ -350,8 +361,14 @@ class Project3D:
     def build_column_options(self, kv_override: float | None = None) -> ColumnOptions:
         a = self.analysis
         pore = a.pore_mode
+        pore_fn = None
         if pore == "water_table" and self.water_table is None:
             pore = "none"
+        elif pore == "seepage":
+            seep_grid = solve_seepage_3d(self.build_model(), bc=self.seepage_bc, gamma_w=a.gamma_w)
+            pore_fn = seep_grid.pore_pressure_at
+            if self.water_table is None:
+                self.water_table = seep_grid.phreatic_horizon()
         return ColumnOptions(
             nx=a.nx,
             ny=a.ny,
@@ -365,6 +382,7 @@ class Project3D:
             azimuth_deg=a.azimuth_deg,
             min_depth=a.min_depth,
             loads=self.build_loads(),
+            pore_pressure_fn=pore_fn,
         )
 
     def build_search_settings(self) -> SearchSettings3D:
@@ -374,6 +392,9 @@ class Project3D:
             effort=sc.effort,
             primary_method=sc.primary_method,
             optimize_azimuth=sc.optimize_azimuth,
+            sao_enabled=sc.sao_enabled,
+            n_workers=self.analysis.n_workers,
+            gle_interslice=self.analysis.gle_interslice,
             check_admissibility=self.analysis.check_admissibility,
             m_alpha_min=self.analysis.m_alpha_min,
             seed=sc.seed,
@@ -417,6 +438,7 @@ class Project3D:
             "support_types": [st.to_dict() for st in self.support_types],
             "bolts": copy.deepcopy(self.bolts),
             "tension_crack": None if self.tension_crack is None else self.tension_crack.to_dict(),
+            "seepage_bc": None if self.seepage_bc is None else self.seepage_bc.to_dict(),
             "analysis": asdict(self.analysis),
             "surface_config": asdict(self.surface_config),
         }
@@ -452,6 +474,7 @@ class Project3D:
         point_loads = [PointLoad3D.from_dict(p) for p in d.get("point_loads", [])]
         support_types = [SupportType3D.from_dict(s) for s in d.get("support_types", [])]
         tc = TensionCrack3D.from_dict(d["tension_crack"]) if d.get("tension_crack") else None
+        seep_bc = SeepageBC3D.from_dict(d["seepage_bc"]) if d.get("seepage_bc") else None
 
         an_raw = {
             k: v
@@ -482,6 +505,7 @@ class Project3D:
             support_types=support_types,
             bolts=list(d.get("bolts", [])),
             tension_crack=tc,
+            seepage_bc=seep_bc,
             analysis=AnalysisSettings3D(**an_raw),
             surface_config=SurfaceConfig3D(**sc_raw),
         )
@@ -1095,6 +1119,79 @@ def reinforced_3d_valley_project() -> Project3D:
     )
 
 
+def rock_wedge_3d_project() -> Project3D:
+    """Hoek & Bray (1981) Symmetric 3D Rock Wedge Analytical Benchmark.
+
+    Intersection line plunges psi_i = 30 deg toward -X (180 deg) from toe (x=10, y=25, z=0);
+    joint planes tilt laterally at beta = 35 deg (half-wedge angle xi = 55 deg).
+    For c = 0, phi = 38 deg, exact Hoek & Bray (1981) 3D FoS = tan(38)/(tan(30)*cos(35)) = 1.651975.
+    """
+    model = simple_3d_slope(
+        height=20.0,
+        ratio_h_to_v=0.5,
+        toe_x=10.0,
+        left_bench=10.0,
+        right_bench=35.0,
+        depth_below_toe=10.0,
+        width_y=50.0,
+        material="Jointed Granite",
+    )
+    mat = MaterialSpec3D(
+        name="Jointed Granite",
+        model="MC",
+        gamma=26.0,
+        gamma_sat=26.5,
+        c=0.0,
+        phi=38.0,
+        use_water=False,
+        color="#9b7ec8",
+    )
+    tan_psi = float(np.tan(np.radians(30.0)))
+    # Dihedral tilt beta = 35 deg perpendicular to plunging intersection line -> dz/dy = tan(beta)/cos(psi_i)
+    tan_beta = float(np.tan(np.radians(35.0)) / np.cos(np.radians(30.0)))
+    dip_deg = float(np.degrees(np.arctan(np.hypot(tan_psi, tan_beta))))
+    dd1 = float(np.degrees(np.arctan2(-tan_beta, -tan_psi)) % 360.0)
+    dd2 = float(np.degrees(np.arctan2(tan_beta, -tan_psi)) % 360.0)
+    wedge = MultiPlaneWedgeSurface(
+        planes=[
+            WedgePlane3D(
+                dip_deg=dip_deg, dip_dir_deg=dd1, x0=10.0, y0=25.0, z0=0.0, name="Joint A"
+            ),
+            WedgePlane3D(
+                dip_deg=dip_deg, dip_dir_deg=dd2, x0=10.0, y0=25.0, z0=0.0, name="Joint B"
+            ),
+        ],
+        bounds=(10.0, 50.0, 2.0, 48.0),
+    )
+    return Project3D(
+        summary=ProjectSummary3D(
+            title="Hoek & Bray (1981) 3D Rock Wedge Benchmark",
+            notes="Symmetric 2-plane rock wedge (plunge=30 deg, half-wedge=55 deg, phi=38 deg; exact 3D FoS = 1.6520).",
+        ),
+        materials=[mat],
+        x_min=model.x_min,
+        x_max=model.x_max,
+        y_min=model.y_min,
+        y_max=model.y_max,
+        z_min=model.z_min,
+        ground=model.ground,
+        layers=model.layers,
+        analysis=AnalysisSettings3D(
+            methods=["janbu_simplified", "spencer", "gle_mp", "cheng_yip"],
+            nx=32,
+            ny=32,
+            sliding_mode="auto",
+            pore_mode="none",
+        ),
+        surface_config=SurfaceConfig3D(
+            mode="user",
+            surface_kind="wedge",
+            primary_method="spencer",
+            user_surface=wedge.to_dict(),
+        ),
+    )
+
+
 EXAMPLE_PROJECTS_3D: dict[str, tuple[str, Any]] = {
     "acads_1a_3d": ("ACADS 1(a) Homogeneous 3D Slope (Search)", extruded_acads_1a_project),
     "hungr_1987_hemisphere": (
@@ -1108,6 +1205,10 @@ EXAMPLE_PROJECTS_3D: dict[str, tuple[str, Any]] = {
     "zhang_1988_weak_seam": (
         "Zhang (1988) Ex. 2 — 3D Ellipsoid + Weak Seam",
         zhang_1988_weak_seam_project,
+    ),
+    "rock_wedge_3d": (
+        "Hoek & Bray (1981) 3D Rock Wedge Benchmark",
+        rock_wedge_3d_project,
     ),
     "reinforced_valley_3d": (
         "3D Lofted Cut Slope with Tiebacks & Water",

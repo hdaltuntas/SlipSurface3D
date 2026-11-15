@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -308,3 +309,68 @@ class LoadSet3D:
     point_loads: list[PointLoad3D] = field(default_factory=list)
     bolts: list[Bolt3D] = field(default_factory=list)
     tension_crack: TensionCrack3D | None = None
+
+
+@dataclass
+class BoltPatternSpec3D:
+    """Specification for an automatic 3D slope-face reinforcement bolt array."""
+
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+    spacing_x: float = 3.0
+    spacing_y: float = 3.0
+    length_m: float = 12.0
+    plunge_deg: float = 15.0  # downward angle below horizontal [deg]
+    trend_azimuth_deg: float = 0.0  # horizontal bearing from collar toward anchor tip [deg]
+    support_type_name: str = "Tieback 1"
+    label_prefix: str = "Pattern Bolt"
+    stagger_rows: bool = False
+
+
+def generate_bolt_pattern_3d(
+    ground_z_fn: Callable[[Any, Any], np.ndarray],
+    spec: BoltPatternSpec3D,
+) -> list[dict[str, Any]]:
+    """Generate collar-on-terrain 3D bolt dicts ``[{head, tip, type, label}, ...]`` over a patch."""
+    if spec.length_m <= 0.0 or spec.spacing_x <= 0.0 or spec.spacing_y <= 0.0:
+        raise ValueError("BoltPatternSpec3D requires positive length_m, spacing_x, and spacing_y.")
+    x0, x1 = (spec.x_min, spec.x_max) if spec.x_min <= spec.x_max else (spec.x_max, spec.x_min)
+    y0, y1 = (spec.y_min, spec.y_max) if spec.y_min <= spec.y_max else (spec.y_max, spec.y_min)
+
+    nx = max(1, int(np.floor((x1 - x0) / spec.spacing_x + 1e-9)) + 1)
+    ny = max(1, int(np.floor((y1 - y0) / spec.spacing_y + 1e-9)) + 1)
+    xs = x0 + np.arange(nx, dtype=float) * spec.spacing_x if nx > 1 else np.array([0.5 * (x0 + x1)])
+    ys_base = (
+        y0 + np.arange(ny, dtype=float) * spec.spacing_y if ny > 1 else np.array([0.5 * (y0 + y1)])
+    )
+
+    pl_rad = float(np.radians(spec.plunge_deg))
+    az_rad = float(np.radians(spec.trend_azimuth_deg))
+    dir_vec = float(spec.length_m) * np.array(
+        [np.cos(pl_rad) * np.cos(az_rad), np.cos(pl_rad) * np.sin(az_rad), -np.sin(pl_rad)],
+        dtype=float,
+    )
+
+    bolts_out: list[dict[str, Any]] = []
+    idx = 1
+    for r_i, xv in enumerate(xs):
+        y_shift = (0.5 * spec.spacing_y) if (spec.stagger_rows and (r_i % 2 == 1)) else 0.0
+        for yv_raw in ys_base:
+            yv = float(yv_raw + y_shift)
+            if yv > y1 + 1e-6:
+                continue
+            zv = float(np.asarray(ground_z_fn(float(xv), yv), dtype=float).ravel()[0])
+            head = np.array([float(xv), yv, zv], dtype=float)
+            tip = head + dir_vec
+            bolts_out.append(
+                {
+                    "head": [float(head[0]), float(head[1]), float(head[2])],
+                    "tip": [float(tip[0]), float(tip[1]), float(tip[2])],
+                    "type": spec.support_type_name,
+                    "label": f"{spec.label_prefix} {idx}",
+                }
+            )
+            idx += 1
+    return bolts_out

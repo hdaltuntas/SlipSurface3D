@@ -48,6 +48,11 @@ files = [
     "slipsurface3d/project.py",
     "slipsurface3d/analysis.py",
     "slipsurface3d/exchange.py",
+    "slipsurface3d/probabilistic.py",
+    "slipsurface3d/seismic.py",
+    "slipsurface3d/seepage.py",
+    "slipsurface3d/cross_section.py",
+    "slipsurface3d/scripting.py",
 ]
 ignore_missing_imports = true
 check_untyped_defs = true
