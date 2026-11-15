@@ -3,10 +3,61 @@
 from __future__ import annotations
 
 import os
+import sys
+from collections.abc import MutableMapping
 
-os.environ.setdefault("QT_API", "pyside6")
+_LC_VARS = (
+    "LC_ALL",
+    "LANG",
+    "LC_CTYPE",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "LC_MESSAGES",
+)
+
+
+def configure_qt_vtk_env(
+    env: MutableMapping[str, str] | None = None,
+    platform_str: str | None = None,
+) -> None:
+    """Configure Qt6 + VTK environment variables before QApplication initializes.
+
+    * Sets ``QT_API=pyside6`` so ``qtawesome`` never binds ``PyQt6`` when both are installed.
+    * Upgrades ``C`` / ``POSIX`` locale settings to ``C.UTF-8`` so Qt6 never emits
+      ``Detected locale "C" with character encoding "ANSI_X3.4-1968"`` warnings, and
+      enforces ``LC_NUMERIC=C.UTF-8`` so VTK/OpenGL shaders always parse ``.`` decimals.
+    * On Linux Wayland sessions, ``vtkXOpenGLRenderWindow`` requires an X11 32-bit Window XID
+      (whereas Qt's native ``wayland`` plugin returns a 64-bit ``wl_surface*`` pointer, triggering
+      ``vtkXOpenGLRenderWindow: The result is out of range, failed to get the converted tmp``).
+      Automatically selects ``QT_QPA_PLATFORM=xcb`` via XWayland when ``DISPLAY`` is present,
+      or ``offscreen`` when running on pure headless Wayland without XWayland.
+    """
+    target = os.environ if env is None else env
+    plat = sys.platform if platform_str is None else platform_str
+
+    target.setdefault("QT_API", "pyside6")
+
+    for var in _LC_VARS:
+        if target.get(var) in ("C", "POSIX"):
+            target[var] = "C.UTF-8"
+    if not target.get("LANG") and not target.get("LC_ALL"):
+        target["LANG"] = "C.UTF-8"
+    if not target.get("LC_ALL"):
+        target["LC_NUMERIC"] = "C.UTF-8"
+
+    if plat.startswith("linux") and not target.get("QT_QPA_PLATFORM"):
+        is_wayland = bool(target.get("WAYLAND_DISPLAY")) or (
+            target.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        )
+        if is_wayland:
+            target["QT_QPA_PLATFORM"] = "xcb" if target.get("DISPLAY") else "offscreen"
+
+
+configure_qt_vtk_env()
 
 from slipsurface3d.ui.main_window import MainWindow3D  # noqa: E402
 from slipsurface3d.ui.viewport3d import Viewport3D  # noqa: E402
 
-__all__ = ["MainWindow3D", "Viewport3D"]
+__all__ = ["MainWindow3D", "Viewport3D", "configure_qt_vtk_env"]

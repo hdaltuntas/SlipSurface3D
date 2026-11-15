@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from slipsurface3d.project import Project3D
+from slipsurface3d.ui import configure_qt_vtk_env
 from slipsurface3d.ui.dialogs import (
     AnalysisSurfaceDialog,
     BoreholesDialog,
@@ -109,3 +110,28 @@ def test_dialogs_construct_and_apply_cleanly(qapp):
     assert d_col.table.rowCount() == win.results.columns.n
     d_col.close()
     win.close()
+
+
+def test_wayland_and_c_locale_env_guard():
+    env_wayland = {
+        "XDG_SESSION_TYPE": "wayland",
+        "WAYLAND_DISPLAY": "wayland-1",
+        "DISPLAY": ":0",
+        "LC_ALL": "C",
+        "LANG": "POSIX",
+    }
+    configure_qt_vtk_env(env=env_wayland, platform_str="linux")
+    assert env_wayland["QT_QPA_PLATFORM"] == "xcb"
+    assert env_wayland["LC_ALL"] == "C.UTF-8"
+    assert env_wayland["LANG"] == "C.UTF-8"
+    assert env_wayland["QT_API"] == "pyside6"
+
+    # Explicit QT_QPA_PLATFORM=offscreen must never be overridden
+    env_off = {
+        "QT_QPA_PLATFORM": "offscreen",
+        "WAYLAND_DISPLAY": "wayland-1",
+        "DISPLAY": ":0",
+    }
+    configure_qt_vtk_env(env=env_off, platform_str="linux")
+    assert env_off["QT_QPA_PLATFORM"] == "offscreen"
+    assert env_off["LC_NUMERIC"] == "C.UTF-8"

@@ -86,7 +86,10 @@ class Viewport3D(QWidget):
         self._theme: str = "dark"
 
         platform_name = QGuiApplication.platformName().lower()
-        self._offscreen_mode = platform_name in ("offscreen", "minimal")
+        self._offscreen_mode = platform_name in (
+            "offscreen",
+            "minimal",
+        ) or platform_name.startswith("wayland")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)

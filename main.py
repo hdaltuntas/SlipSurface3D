@@ -37,6 +37,12 @@ def _run_headless_check(project_file: str | None = None) -> int:
 
 
 def _run_gui(project_file: str | None = None, smoke_seconds: float | None = None) -> int:
+    import locale
+
+    from slipsurface3d.ui import configure_qt_vtk_env
+
+    configure_qt_vtk_env()
+
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
 
@@ -46,6 +52,12 @@ def _run_gui(project_file: str | None = None, smoke_seconds: float | None = None
     app = QApplication.instance()
     if not isinstance(app, QApplication):
         app = QApplication(sys.argv)
+    for loc_name in ("C.UTF-8", "en_US.UTF-8", "C"):
+        try:
+            locale.setlocale(locale.LC_NUMERIC, loc_name)
+            break
+        except locale.Error:
+            continue
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
     apply_theme(app, current_theme())
