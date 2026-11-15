@@ -6,8 +6,32 @@ from PySide6.QtCore import QSettings
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
+from slipsurface3d import APP_NAME, __version__
+
 ORG_NAME = "SlipSurfaceIQ"
 APP_SETTINGS_NAME = "SlipSurfaceIQ-3D"
+
+ABOUT_HTML = f"""
+<h3>{APP_NAME} {__version__}</h3>
+<p>Three-Dimensional Limit-Equilibrium Slope Stability</p>
+<p>© 2026 Hasan Deniz Altuntaş — GNU AGPL v3 or later. No warranty.</p>
+<table cellpadding="5">
+<tr><th>Technology</th><th>License</th></tr>
+<tr><td>Python</td><td>PSF License</td></tr>
+<tr><td>PySide6 / Qt / Shiboken6</td><td>LGPL-3.0 / GPL-3.0 / commercial</td></tr>
+<tr><td>NumPy · SciPy</td><td>BSD-3-Clause</td></tr>
+<tr><td>PyVista · VTK</td><td>BSD-3-Clause</td></tr>
+<tr><td>Shapely</td><td>BSD-3-Clause (GEOS: LGPL-2.1)</td></tr>
+<tr><td>ReportLab</td><td>BSD</td></tr>
+<tr><td>ezdxf</td><td>MIT</td></tr>
+<tr><td>QtAwesome · QtPy</td><td>MIT</td></tr>
+<tr><td>Material Design Icons (Pictogrammers)</td><td>Apache-2.0</td></tr>
+</table>
+<p><a href="https://doc.qt.io/qtforpython-6/licenses.html">Qt licenses</a> ·
+<a href="https://github.com/spyder-ide/qtawesome/blob/master/LICENSE.txt">QtAwesome licenses</a> ·
+<a href="https://github.com/pyvista/pyvista/blob/main/LICENSE">PyVista license</a> ·
+<a href="https://github.com/mozman/ezdxf/blob/master/LICENSE">ezdxf license</a></p>
+"""
 
 
 def _settings() -> QSettings:

@@ -658,7 +658,7 @@ def compute_safety_map_3d(
         sub_x = xx[ix0:ix1, iy0:iy1]
         sub_y = yy[ix0:ix1, iy0:iy1]
         sub_zg = zg[ix0:ix1, iy0:iy1]
-        zb = surf.z(sub_x, sub_y)
+        zb = surf.sample_base(sub_x, sub_y, sub_zg, model.z_min).z
         active = np.isfinite(zb) & ((sub_zg - zb) >= min_depth)
         if not np.any(active):
             continue

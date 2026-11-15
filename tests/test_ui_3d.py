@@ -18,7 +18,7 @@ from slipsurface3d.ui.dialogs import (
     SeismicNewmark3DDialog,
 )
 from slipsurface3d.ui.main_window import MainWindow3D
-from slipsurface3d.ui.preferences import apply_theme
+from slipsurface3d.ui.preferences import ABOUT_HTML, apply_theme
 
 
 def test_main_window_3d_compute_views_undo_and_exports(qapp, tmp_path: Path):
@@ -102,11 +102,15 @@ def test_dialogs_construct_and_apply_cleanly(qapp):
     assert len(d_ld.patch_loads) == 1 and len(d_ld.bolts) == 1
     d_ld.close()
 
-    # AnalysisSurfaceDialog
+    # AnalysisSurfaceDialog — keep primary method when extra solvers are ticked
     d_an = AnalysisSurfaceDialog(win.project, win)
+    assert win.project.surface_config.primary_method == "bishop"
     d_an.nx_sp.setValue(22)
+    d_an.meth_checks["ordinary"].setChecked(True)
     d_an._on_accept()
     assert win.project.analysis.nx == 22
+    assert "ordinary" in win.project.analysis.methods
+    assert win.project.surface_config.primary_method == "bishop"
     d_an.close()
 
     # ColumnDataDialog
@@ -133,6 +137,16 @@ def test_dialogs_construct_and_apply_cleanly(qapp):
     assert d_sec.table.rowCount() >= 1
     d_sec.close()
 
+    win.close()
+
+
+def test_about_dialog_agpl_notice(qapp):
+    assert "GNU AGPL" in ABOUT_HTML
+    assert "Hasan Deniz Altuntaş" in ABOUT_HTML
+    win = MainWindow3D()
+    help_titles = [a.text() for a in win.menuBar().actions()]
+    assert any("Help" in t for t in help_titles)
+    assert win.act_about.text().startswith("About ")
     win.close()
 
 

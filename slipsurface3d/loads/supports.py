@@ -239,23 +239,12 @@ class Bolt3D:
         if total_len <= 1e-6:
             return None
 
-        ts = np.linspace(0.0, 1.0, n_samples)
-        pts = a[None, :] + ts[:, None] * ab[None, :]
-        zb = surface.z(pts[:, 0], pts[:, 1])
-        diff = pts[:, 2] - zb  # > 0 inside/above slip surface, < 0 below slip surface
-        valid = np.isfinite(diff)
-        if np.count_nonzero(valid) < 2:
+        hit = surface.intersect_segment(a, b, n_samples=n_samples)
+        if hit is None:
             return None
-
-        # Locate crossing from diff >= 0 (head side) to diff < 0 (anchor side)
-        hit_t: float | None = None
-        for k in range(n_samples - 1):
-            if valid[k] and valid[k + 1] and diff[k] >= 0.0 and diff[k + 1] < 0.0:
-                denom = diff[k] - diff[k + 1]
-                frac = float(diff[k] / denom) if abs(denom) > 1e-12 else 0.5
-                hit_t = float(ts[k] + frac * (ts[k + 1] - ts[k]))
-                break
-        if hit_t is None:
+        hit_xyz, _normal = hit
+        hit_t = float(np.dot(hit_xyz - a, ab) / (total_len * total_len))
+        if not 0.0 <= hit_t <= 1.0:
             return None
 
         l_above = hit_t * total_len
@@ -264,7 +253,6 @@ class Bolt3D:
         if cap <= 0.0:
             return None
 
-        hit_xyz = a + hit_t * ab
         if self.support_type.kind == "micropile":
             # Micropile resists along local basal shear plane (handled by caller using sliding azimuth)
             unit_vec = ab / total_len

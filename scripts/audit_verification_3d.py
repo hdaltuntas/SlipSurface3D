@@ -4,10 +4,12 @@
 Verifies:
 1. Closed-form analytical phi=0 3D spherical cap on a 2H:1V slope (Baligh & Azzouz 1975; Hungr 1987).
 2. 2D -> 3D cylindrical extrusion invariance across Ordinary, Bishop, Janbu Simplified,
-   Janbu Corrected, and Spencer (comparing against analytical 2D limit / independent 1D strip).
+   Janbu Corrected, Spencer, GLE/M-P, and Cheng & Yip (comparing against analytical 2D
+   limit / independent 1D strip).
 3. Zhang (1988) / Hungr et al. (1989) Example 1 (Homogeneous 3D Ellipsoid, published FoS = 2.122).
 4. Zhang (1988) / Hungr et al. (1989) Example 2 (3D Ellipsoid + Weak Seam, published FoS = 1.553).
-5. Symmetry & azimuth invariance under 90/180/270-degree coordinate rotations.
+5. Symmetry & azimuth invariance under 90-degree coordinate rotation.
+6. Hoek & Bray (1981) closed-form 3D rock wedge.
 """
 
 from __future__ import annotations

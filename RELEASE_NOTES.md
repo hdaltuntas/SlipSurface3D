@@ -1,10 +1,32 @@
 # Release Notes — SlipSurfaceIQ-3D `2026.7.1`
 
-## Highlights
-- Initial standalone release of **SlipSurfaceIQ-3D** (`2026.7.1`).
-- Implemented 3D Method of Columns solvers: **3D Ordinary**, **3D Simplified Bishop**, **3D Simplified & Corrected Janbu**, and **3D Rigorous Spencer**.
-- Added Cuckoo Search + Nelder-Mead global 3D optimizer for spheres, tri-axial ellipsoids, and non-ellipsoidal 3D spline bowls.
-- Added lossless 2D `.slp.json` project importer & extruder (`import_2d_project`) compatible with `SlipSurfaceIQ-LE`.
-- Added 10 constitutive models including **3D Dip / Dip-Direction Anisotropic Bedding**, plus 3D patch/point loads, discrete 3D reinforcement bolts, and tension cracks.
-- Built PySide6 + PyVista/VTK interactive 3D desktop workstation with offscreen rendering support, 3D DXF/OBJ CAD exchange, and ReportLab PDF engineering reports.
-- Verified against closed-form analytical $\phi = 0$ 3D spherical cap (`< 0.01%` error), 2D cylindrical extrusion invariance (`< 1e-12` across `ny`), and Zhang (1988) / Hungr et al. (1989) 3D benchmark cases.
+Standalone 3D companion to SlipSurfaceIQ-LE. Licensed under GNU AGPL v3 or later.
+
+## Solvers
+- 3D Ordinary / Fellenius, Simplified Bishop, Simplified and Corrected Janbu, and Rigorous Spencer (Lam & Fredlund 1993).
+- 3D General Limit Equilibrium / Morgenstern-Price (`gle_mp`) with strip-wise intercolumn functions: constant, half-sine, clipped-sine, trapezoidal.
+- 3D Cheng & Yip (2007) asymmetric equilibrium (`cheng_yip`): simultaneous $\sum F_s = 0$, $\sum F_t = 0$, and $\sum M = 0$ for the oblique sliding azimuth $\psi^*$.
+
+## Search and surfaces
+- Cuckoo Search + Nelder-Mead global optimizer for spheres, tri-axial ellipsoids, and non-ellipsoidal 3D spline bowls.
+- Multi-scale Surface Altering Optimization (SAO: 3×3 → 5×5 bicubic spline refinement) and multi-core parallel search.
+- 3D slope-wide Safety Map projecting trial slip bowls onto ground topography.
+- Multi-plane rock wedge (`MultiPlaneWedgeSurface`) matching Hoek & Bray (1981) closed-form 3D wedge mechanics.
+
+## Groundwater, seismic, reliability
+- 3D steady-state anisotropic seepage Laplace solver $\nabla \cdot (\mathbf{K}\nabla H) = 0$ with atmospheric seepage-face breakout.
+- Critical yield acceleration $k_y$ ($F_s(k_y) = 1.0$) and Newmark permanent displacement (Jibson 2007, Ambraseys & Menu 1988, accelerogram double integration).
+- Latin Hypercube and Monte Carlo 3D reliability ($P_f$, $\beta_N$, $\beta_{LN}$) with tornado sensitivity.
+
+## Geometry, loads, and exchange
+- Lossless 2D `.slp.json` importer and extruder (`import_2d_project`) compatible with SlipSurfaceIQ-LE.
+- Ten constitutive models including 3D dip / dip-direction anisotropic bedding.
+- 3D patch/point loads, discrete reinforcement bolts, automatic bolt-pattern generator, and tension cracks.
+- 2D↔3D cross-section slicer and $F_{3D}/F_{2D}$ end-effect analyzer.
+- ESRI ASCII DEM, XYZ/CSV, binary/ASCII STL, Wavefront OBJ, and 3D DXF (`3DFACE`) exchange.
+
+## Desktop UI, scripting, and verification
+- PySide6 + PyVista/VTK workstation with Wayland XWayland (`xcb`) fallback, offscreen rendering, live search preview, stop/cancel, picked-column free-body arrows, and ReportLab A4 PDF reports.
+- Python scripting and batch API (`slipsurface3d.scripting`).
+- Verified against the closed-form $\phi = 0$ 3D spherical cap (`< 0.01%` error), 2D cylindrical extrusion invariance (`|ΔFoS| < 1e-12` across `ny`, including GLE and Cheng & Yip), Zhang (1988) / Hungr et al. (1989) ellipsoid cases, 90° azimuth invariance, and Hoek & Bray (1981) 3D rock wedge (`|ΔFoS| < 1e-10`).
+- Interactive analyses default to a `28 × 24` column grid; published verification cases use `64–72` columns per axis.

@@ -15,8 +15,9 @@ For $R = 15.0\text{ m}$, $d = 11.5\text{ m}$, $\tan\beta = 0.5$ ($2\text{H}:1\te
 ## 2. 2D → 3D Cylindrical Extrusion Invariance
 
 When any 2D slope profile and circular slip surface (`ry -> infinity`) are extruded along $Y \in [y_{\min}, y_{\max}]$, every column has transverse basal inclination $\alpha_t = 0$, so cell width $\Delta y$ cancels identically from force and moment equilibrium.
-- Verified across `ordinary`, `bishop`, `janbu_simplified`, `janbu_corrected`, and `spencer`:
+- Verified across `ordinary`, `bishop`, `janbu_simplified`, `janbu_corrected`, `spencer`, `gle_mp`, and `cheng_yip`:
   - `ny = 1` ($W_y = 10\text{ m}$) vs `ny = 16` ($W_y = 80\text{ m}$): **`|ΔFoS| < 1e-12`**, matching 2D `SlipSurfaceIQ-LE` to 5 significant digits (including Spencer's intercolumn inclination $\lambda$).
+- Interactive analyses default to `nx = 28`, `ny = 24`. The spherical-cap and Zhang cases in this document use `nx = ny = 48–72`.
 
 ## 3. Zhang (1988) / Hungr et al. (1989) Benchmark Cases
 

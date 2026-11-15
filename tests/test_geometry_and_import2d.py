@@ -8,12 +8,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from slipsurface3d.analysis import run_analysis_3d
 from slipsurface3d.geometry import (
     BoreholeLayer,
     BoreholeLog,
     CompositeEllipsoidPlaneSurface,
     EllipsoidSurface,
     HorizonSurface,
+    ImplicitSlipSurface,
     MeshSlipSurface,
     SplinePatchSurface,
     cylindrical_surface,
@@ -22,7 +24,12 @@ from slipsurface3d.geometry import (
     sphere_surface,
     surface_from_dict,
 )
-from slipsurface3d.project import Project3D, extruded_acads_1a_project, import_2d_project
+from slipsurface3d.project import (
+    Project3D,
+    extruded_acads_1a_project,
+    hungr_1987_hemisphere_project,
+    import_2d_project,
+)
 
 
 def test_horizon_representations_and_serialization():
@@ -128,6 +135,96 @@ def test_3d_slip_surface_gradients_and_roundtrip():
     assert s_sph.is_spherical
     s_cyl = cylindrical_surface(10.0, 15.0, 12.0)
     assert not s_cyl.is_spherical
+
+
+def test_closed_ellipsoid_returns_both_sheets_and_picks_the_floor():
+    ell = EllipsoidSurface(xc=20.0, yc=15.0, zc=18.0, rx=14.0, ry=22.0, rz=12.0, sheet="both")
+    z_hits, nrm = ell.vertical_hits(20.0, 15.0)
+    finite = np.isfinite(z_hits)
+    assert int(np.count_nonzero(finite)) == 2
+    assert nrm[0, 2] < 0.0
+    assert nrm[1, 2] > 0.0
+    samp = ell.sample_base(20.0, 15.0, 40.0, 0.0)
+    assert int(samp.n_hits) == 2
+    assert np.isclose(float(samp.z), float(ell.z(20.0, 15.0)), atol=1e-9)
+    assert float(samp.normal_xyz[2]) > 0.0
+    rt = surface_from_dict(ell.to_dict())
+    assert isinstance(rt, EllipsoidSurface) and rt.sheet == "both"
+
+
+def test_overhanging_triangle_mesh_skips_roof_and_keeps_floor():
+    verts = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [10.0, 0.0, 1.0],
+            [0.0, 10.0, 1.0],
+            [10.0, 10.0, 1.0],
+            [0.0, 0.0, 6.0],
+            [10.0, 0.0, 6.0],
+            [0.0, 10.0, 6.0],
+            [10.0, 10.0, 6.0],
+        ]
+    )
+    faces = np.array(
+        [
+            [0, 1, 2],
+            [1, 3, 2],
+            [4, 6, 5],
+            [5, 6, 7],
+        ],
+        dtype=np.int64,
+    )
+    ms = MeshSlipSurface(verts, faces=faces)
+    assert not ms.graph_valued
+    z_hits, nrm = ms.vertical_hits(5.0, 5.0)
+    assert int(np.count_nonzero(np.isfinite(z_hits))) >= 2
+    assert nrm[0, 2] < 0.0
+    samp = ms.sample_base(5.0, 5.0, 12.0, -1.0)
+    assert int(samp.n_hits) == 2
+    assert np.isclose(float(samp.z), 1.0, atol=1e-6)
+    assert float(samp.normal_xyz[2]) > 0.0
+    rt = surface_from_dict(ms.to_dict())
+    assert isinstance(rt, MeshSlipSurface) and rt.faces is not None
+
+
+def test_implicit_sphere_matches_closed_ellipsoid_floor():
+    ell = EllipsoidSurface(xc=20.0, yc=15.0, zc=18.0, rx=12.0, ry=12.0, rz=12.0, sheet="both")
+
+    def fn(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+        return ((x - 20.0) / 12.0) ** 2 + ((y - 15.0) / 12.0) ** 2 + ((z - 18.0) / 12.0) ** 2 - 1.0
+
+    def grad_fn(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+        return np.stack(
+            [
+                2.0 * (x - 20.0) / 144.0,
+                2.0 * (y - 15.0) / 144.0,
+                2.0 * (z - 18.0) / 144.0,
+            ],
+            axis=-1,
+        )
+
+    imp = ImplicitSlipSurface(
+        fn=fn, grad_fn=grad_fn, bounds=(5.0, 35.0, 0.0, 30.0, 0.0, 40.0), n_z_scan=64
+    )
+    assert not imp.graph_valued
+    assert np.isclose(float(imp.z(20.0, 15.0)), float(ell.z(20.0, 15.0)), atol=0.05)
+    samp = imp.sample_base(20.0, 15.0, 40.0, 0.0)
+    assert int(samp.n_hits) >= 2
+    assert float(samp.normal_xyz[2]) > 0.0
+
+
+def test_closed_ellipsoid_columns_match_lower_sheet_fos():
+    p_lo = hungr_1987_hemisphere_project()
+    p_lo.analysis.nx = p_lo.analysis.ny = 24
+    r_lo = run_analysis_3d(p_lo)
+
+    p_both = p_lo.copy()
+    surf = p_both.user_slip_surface()
+    assert isinstance(surf, EllipsoidSurface)
+    surf.sheet = "both"
+    p_both.surface_config.user_surface = surf.to_dict()
+    r_both = run_analysis_3d(p_both)
+    assert np.isclose(r_lo.primary_result.fos, r_both.primary_result.fos, rtol=1e-6, atol=1e-6)
 
 
 def test_project3d_save_load_validation(tmp_path: Path):

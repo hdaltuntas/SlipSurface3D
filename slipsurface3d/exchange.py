@@ -67,7 +67,24 @@ def import_obj_horizon(path: str | Path, name: str = "Imported OBJ Terrain") -> 
 
 
 def import_obj_slip_surface(path: str | Path) -> MeshSlipSurface:
-    pts = import_obj_vertices(path)
+    verts: list[list[float]] = []
+    faces: list[list[int]] = []
+    for raw in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if line.startswith("v "):
+            parts = line.split()
+            if len(parts) >= 4:
+                verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
+        elif line.startswith("f "):
+            idx = [int(p.split("/")[0]) - 1 for p in line.split()[1:] if p]
+            if len(idx) >= 3:
+                for k in range(1, len(idx) - 1):
+                    faces.append([idx[0], idx[k], idx[k + 1]])
+    if len(verts) < 3:
+        raise ValueError(f"OBJ file '{path}' contains fewer than 3 vertices.")
+    pts = np.asarray(verts, dtype=float)
+    if faces:
+        return MeshSlipSurface(vertices=pts, faces=np.asarray(faces, dtype=np.int64))
     return MeshSlipSurface(vertices=pts)
 
 
@@ -207,8 +224,8 @@ def import_stl_horizon(path: str | Path, name: str = "Imported STL Terrain") -> 
 
 
 def import_stl_slip_surface(path: str | Path) -> MeshSlipSurface:
-    pts = import_stl_vertices(path)
-    return MeshSlipSurface(vertices=pts)
+    mesh = pv.read(str(path))
+    return MeshSlipSurface.from_polydata(mesh)
 
 
 def export_esri_ascii_dem(

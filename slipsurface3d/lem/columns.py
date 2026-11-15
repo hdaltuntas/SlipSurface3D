@@ -316,9 +316,10 @@ def _tight_active_bounds(
     xs = np.linspace(x0, x1, nx_p)
     ys = np.linspace(y0, y1, ny_p)
     xx, yy = np.meshgrid(xs, ys, indexing="ij")
-    zb = surface.z(xx, yy)
     zg = model.ground_z(xx, yy)
-    active = np.isfinite(zb) & (zg - zb > 1e-5) & (zb >= model.z_min - 1e-3)
+    samp = surface.sample_base(xx, yy, zg, model.z_min)
+    zb = samp.z
+    active = samp.valid & (zg - zb > 1e-5) & (zb >= model.z_min - 1e-3)
     if not np.any(active):
         raise ColumnDiscretizationError("Slip surface does not intersect below ground surface.")
 
@@ -339,7 +340,9 @@ def _tight_active_bounds(
         y_mid = 0.5 * (ay0 + ay1)
         x_scan = np.linspace(ax0, ax1, 200)
         y_scan = np.full_like(x_scan, y_mid)
-        diff_scan = model.ground_z(x_scan, y_scan) - surface.z(x_scan, y_scan)
+        zg_scan = model.ground_z(x_scan, y_scan)
+        zb_scan = surface.sample_base(x_scan, y_scan, zg_scan, model.z_min).z
+        diff_scan = zg_scan - zb_scan
         pos = np.flatnonzero(np.isfinite(diff_scan) & (diff_scan > 0.0))
         if len(pos) >= 2:
             i_left, i_right = int(pos[0]), int(pos[-1])
@@ -347,7 +350,9 @@ def _tight_active_bounds(
                 lo, hi = float(x_scan[i_left - 1]), float(x_scan[i_left])
                 for _ in range(22):
                     mid = 0.5 * (lo + hi)
-                    val = float(model.ground_z(mid, y_mid) - surface.z(mid, y_mid))
+                    zg_m = float(model.ground_z(mid, y_mid))
+                    zb_m = float(surface.sample_base(mid, y_mid, zg_m, model.z_min).z)
+                    val = zg_m - zb_m
                     if np.isfinite(val) and val > 0.0:
                         hi = mid
                     else:
@@ -357,7 +362,9 @@ def _tight_active_bounds(
                 lo, hi = float(x_scan[i_right]), float(x_scan[i_right + 1])
                 for _ in range(22):
                     mid = 0.5 * (lo + hi)
-                    val = float(model.ground_z(mid, y_mid) - surface.z(mid, y_mid))
+                    zg_m = float(model.ground_z(mid, y_mid))
+                    zb_m = float(surface.sample_base(mid, y_mid, zg_m, model.z_min).z)
+                    val = zg_m - zb_m
                     if np.isfinite(val) and val > 0.0:
                         lo = mid
                     else:
@@ -367,7 +374,9 @@ def _tight_active_bounds(
         x_mid = 0.5 * (ax0 + ax1)
         y_scan = np.linspace(ay0, ay1, 200)
         x_scan = np.full_like(y_scan, x_mid)
-        diff_scan = model.ground_z(x_scan, y_scan) - surface.z(x_scan, y_scan)
+        zg_scan = model.ground_z(x_scan, y_scan)
+        zb_scan = surface.sample_base(x_scan, y_scan, zg_scan, model.z_min).z
+        diff_scan = zg_scan - zb_scan
         pos = np.flatnonzero(np.isfinite(diff_scan) & (diff_scan > 0.0))
         if len(pos) >= 2:
             i_left, i_right = int(pos[0]), int(pos[-1])
@@ -375,7 +384,9 @@ def _tight_active_bounds(
                 lo, hi = float(y_scan[i_left - 1]), float(y_scan[i_left])
                 for _ in range(22):
                     mid = 0.5 * (lo + hi)
-                    val = float(model.ground_z(x_mid, mid) - surface.z(x_mid, mid))
+                    zg_m = float(model.ground_z(x_mid, mid))
+                    zb_m = float(surface.sample_base(x_mid, mid, zg_m, model.z_min).z)
+                    val = zg_m - zb_m
                     if np.isfinite(val) and val > 0.0:
                         hi = mid
                     else:
@@ -385,7 +396,9 @@ def _tight_active_bounds(
                 lo, hi = float(y_scan[i_right]), float(y_scan[i_right + 1])
                 for _ in range(22):
                     mid = 0.5 * (lo + hi)
-                    val = float(model.ground_z(x_mid, mid) - surface.z(x_mid, mid))
+                    zg_m = float(model.ground_z(x_mid, mid))
+                    zb_m = float(surface.sample_base(x_mid, mid, zg_m, model.z_min).z)
+                    val = zg_m - zb_m
                     if np.isfinite(val) and val > 0.0:
                         lo = mid
                     else:
@@ -422,12 +435,16 @@ def discretize_columns(
     ix_grid, iy_grid = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
     xx, yy = np.meshgrid(xs_1d, ys_1d, indexing="ij")
 
-    zb_grid = surface.z(xx, yy)
     zg_grid = model.ground_z(xx, yy)
-    dz_dx_grid, dz_dy_grid = surface.gradients(xx, yy)
+    # Sample without clipping at z_min so a scoop that cuts the model base is rejected whole,
+    # matching the original heightfield discretisation.
+    samp_grid = surface.sample_base(xx, yy, zg_grid, model.z_min - 1.0e6)
+    zb_grid = samp_grid.z
+    dz_dx_grid = samp_grid.dz_dx
+    dz_dy_grid = samp_grid.dz_dy
 
     # Reject if slip surface cuts below the bottom of the geological model domain
-    valid_zb = np.isfinite(zb_grid) & np.isfinite(dz_dx_grid) & np.isfinite(dz_dy_grid)
+    valid_zb = samp_grid.valid & np.isfinite(dz_dx_grid) & np.isfinite(dz_dy_grid)
     below_domain = valid_zb & (zb_grid < zg_grid) & (zb_grid < model.z_min - 1e-4)
     if np.any(below_domain):
         raise ColumnDiscretizationError("Slip surface extends below model base elevation z_min.")
@@ -439,9 +456,10 @@ def discretize_columns(
     xs_c = ax0 + np.arange(nx + 1) * dx
     ys_c = ay0 + np.arange(ny + 1) * dy
     xx_c, yy_c = np.meshgrid(xs_c, ys_c, indexing="ij")
-    zb_c = surface.z(xx_c, yy_c)
     zg_c = model.ground_z(xx_c, yy_c)
-    act_c = np.isfinite(zb_c) & ((zg_c - zb_c) > 1e-5)
+    samp_c = surface.sample_base(xx_c, yy_c, zg_c, model.z_min)
+    zb_c = samp_c.z
+    act_c = samp_c.valid & ((zg_c - zb_c) > 1e-5)
     n_act_c = (
         act_c[:-1, :-1].astype(int)
         + act_c[1:, :-1].astype(int)
@@ -459,10 +477,13 @@ def discretize_columns(
         n_rc = len(rc_x)
         x_sub = (rc_x[:, None, None] + sx_off[None, :, :]).ravel()
         y_sub = (rc_y[:, None, None] + sy_off[None, :, :]).ravel()
-        zb_sub = surface.z(x_sub, y_sub).reshape(n_rc, 4, 4)
         zg_sub = model.ground_z(x_sub, y_sub).reshape(n_rc, 4, 4)
+        samp_sub = surface.sample_base(x_sub, y_sub, zg_sub.ravel(), model.z_min - 1.0e6)
+        zb_sub = samp_sub.z.reshape(n_rc, 4, 4)
         h_sub = zg_sub - zb_sub
-        act_sub = np.isfinite(zb_sub) & (h_sub > 1e-5) & (zb_sub >= model.z_min - 1e-3)
+        act_sub = (
+            samp_sub.valid.reshape(n_rc, 4, 4) & (h_sub > 1e-5) & (zb_sub >= model.z_min - 1e-3)
+        )
         cnt = np.sum(act_sub, axis=(1, 2))
         has_sub = cnt > 0
         if np.any(has_sub):
@@ -476,11 +497,11 @@ def discretize_columns(
                     m_loc = act_sub[loc_i]
                     xb_c = float(np.mean(rc_x[loc_i] + sx_off[m_loc]))
                     yb_c = float(np.mean(rc_y[loc_i] + sy_off[m_loc]))
-                    zb_pt = float(np.asarray(surface.z(xb_c, yb_c)).reshape(-1)[0])
                     zg_pt = float(np.asarray(model.ground_z(xb_c, yb_c)).reshape(-1)[0])
-                    dzx_pt_a, dzy_pt_a = surface.gradients(xb_c, yb_c)
-                    dzx_pt = float(np.asarray(dzx_pt_a).reshape(-1)[0])
-                    dzy_pt = float(np.asarray(dzy_pt_a).reshape(-1)[0])
+                    samp_pt = surface.sample_base(xb_c, yb_c, zg_pt, model.z_min - 1.0e6)
+                    zb_pt = float(np.asarray(samp_pt.z).reshape(-1)[0])
+                    dzx_pt = float(np.asarray(samp_pt.dz_dx).reshape(-1)[0])
+                    dzy_pt = float(np.asarray(samp_pt.dz_dy).reshape(-1)[0])
                     h_mean = float(np.mean(h_sub[loc_i][m_loc]))
                     if (
                         np.isfinite(zb_pt)

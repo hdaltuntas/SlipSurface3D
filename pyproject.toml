@@ -7,6 +7,8 @@ name = "slipsurface3d"
 version = "2026.7.1"
 description = "Three-dimensional limit-equilibrium slope stability analysis (Method of Columns + PyVista/Qt)."
 readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "Hasan Deniz Altuntaş"}]
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
@@ -46,6 +48,9 @@ files = [
     "slipsurface3d/lem",
     "slipsurface3d/optimizer",
     "slipsurface3d/project.py",
+    "slipsurface3d/project_model.py",
+    "slipsurface3d/project_import.py",
+    "slipsurface3d/project_examples.py",
     "slipsurface3d/analysis.py",
     "slipsurface3d/exchange.py",
     "slipsurface3d/probabilistic.py",
@@ -59,7 +64,7 @@ check_untyped_defs = true
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["pyvista", "pyvista.*", "PyQt6", "PyQt6.*"]
+module = ["pyvista", "pyvista.*", "PySide6", "PySide6.*"]
 follow_imports = "skip"
 
 [tool.pytest.ini_options]

@@ -71,7 +71,7 @@ from slipsurface3d.ui.dialogs import (
     ProbabilisticSensitivity3DDialog,
     SeismicNewmark3DDialog,
 )
-from slipsurface3d.ui.preferences import apply_theme, current_theme, push_recent_file
+from slipsurface3d.ui.preferences import ABOUT_HTML, apply_theme, current_theme, push_recent_file
 from slipsurface3d.ui.viewport3d import SCALAR_FIELD_OPTIONS, Viewport3D
 
 
@@ -306,6 +306,11 @@ class MainWindow3D(QMainWindow):
         self.act_theme = QAction("Toggle Dark / Light Theme", self)
         self.act_theme.triggered.connect(self.toggle_theme)
         view_m.addAction(self.act_theme)
+
+        help_m = mb.addMenu("&Help")
+        self.act_about = QAction(f"About {APP_NAME}...", self)
+        self.act_about.triggered.connect(self.show_about)
+        help_m.addAction(self.act_about)
 
         # Assign subtle toolbar icons
         for act, ic_name in (
@@ -960,6 +965,15 @@ class MainWindow3D(QMainWindow):
         if fn:
             self.viewport.export_screenshot(fn)
             self.statusBar().showMessage(f"Saved screenshot to {fn}")
+
+    def show_about(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle(f"About {APP_NAME}")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        box.setText(ABOUT_HTML)
+        box.setStandardButtons(QMessageBox.StandardButton.Close)
+        box.exec()
 
     def toggle_theme(self) -> None:
         app = QApplication.instance()

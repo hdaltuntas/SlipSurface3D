@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from slipsurface3d.geometry.intersection import BaseSample
 from slipsurface3d.geometry.surfaces import (
     CompositeEllipsoidPlaneSurface,
     EllipsoidSurface,
+    ImplicitSlipSurface,
     MeshSlipSurface,
     MultiPlaneWedgeSurface,
     SlipSurface3D,
@@ -26,10 +28,12 @@ from slipsurface3d.geometry.terrain import (
 )
 
 __all__ = [
+    "BaseSample",
     "BoreholeLayer",
     "BoreholeLog",
     "CompositeEllipsoidPlaneSurface",
     "EllipsoidSurface",
+    "ImplicitSlipSurface",
     "ExtrudedProfileRegion",
     "HorizonSurface",
     "MeshSlipSurface",

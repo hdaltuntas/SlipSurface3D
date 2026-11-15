@@ -3,12 +3,16 @@
 Supported 3D slip surfaces:
 * ``EllipsoidSurface``              : General tri-axial 3D ellipsoid (covers spheres when
                                       ``rx == ry == rz`` and 2D circular cylinders when ``ry`` is large).
+                                      Both sheets of the closed ellipsoid are available via
+                                      ``vertical_hits``; ``z(x, y)`` remains the lower (floor) sheet.
 * ``CompositeEllipsoidPlaneSurface``: Ellipsoid truncated by a weak geological plane (e.g. Zhang 1988
                                       and Hungr et al. 1989 weak-seam benchmark).
 * ``SplinePatchSurface``            : Smooth non-ellipsoidal 3D bowl formed by a tensor-product
                                       elevation perturbation over an ``EllipsoidSurface``.
-* ``MeshSlipSurface``               : Arbitrary triangulated / point-cloud 3D slip surface interpolated
-                                      linearly over ``(x, y)``.
+* ``MeshSlipSurface``               : Triangulated 3D slip surface (optional faces). With faces, a
+                                      vertical ray may hit multiple sheets (overhangs / folds);
+                                      without faces the vertices are interpolated as a heightfield.
+* ``ImplicitSlipSurface``           : General F(x, y, z) = 0 manifold sampled by vertical line search.
 """
 
 from __future__ import annotations
@@ -22,20 +26,106 @@ import numpy as np
 import pyvista as pv
 from scipy.interpolate import LinearNDInterpolator, RectBivariateSpline
 
+from slipsurface3d.geometry.intersection import (
+    MAX_VERTICAL_HITS,
+    NZ_FLOOR_MIN,
+    BaseSample,
+    empty_hit_buffers,
+    graph_hits_from_z,
+    pack_hits,
+    pick_floor,
+    ray_triangle_hits,
+    vertical_mesh_hits,
+)
+
 
 class SlipSurface3D(ABC):
-    """Base class for single-valued 3D basal slip surfaces z_b = f(x, y)."""
+    """3D basal slip surface: a heightfield, a closed manifold, or a folded triangle mesh.
+
+    ``z(x, y)`` returns the floor sheet used as the Method-of-Columns base when no ground
+    elevation is supplied (the highest intersection with positive ``n_z``). Column
+    discretisation should call ``sample_base`` so roof-like hits (overhangs) are skipped.
+    """
+
+    graph_valued: bool = True
 
     @abstractmethod
     def z(self, x: Any, y: Any) -> np.ndarray:
-        """Return basal elevation z_b(x, y), or NaN outside the surface footprint."""
+        """Return floor-sheet elevation z_b(x, y), or NaN outside the surface footprint."""
 
     def gradients(self, x: Any, y: Any, eps: float = 1e-5) -> tuple[np.ndarray, np.ndarray]:
-        """Return partial derivatives (dz_dx, dz_dy) at (x, y)."""
+        """Return partial derivatives (dz_dx, dz_dy) of the floor sheet at (x, y)."""
         xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
         dz_dx = (self.z(xa + eps, ya) - self.z(xa - eps, ya)) / (2.0 * eps)
         dz_dy = (self.z(xa, ya + eps) - self.z(xa, ya - eps)) / (2.0 * eps)
         return dz_dx, dz_dy
+
+    def vertical_hits(
+        self, x: Any, y: Any, *, max_hits: int = MAX_VERTICAL_HITS
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """All vertical-line intersections at (x, y).
+
+        Returns ``(z_hits, normals)`` with ``z_hits`` shape ``(..., max_hits)`` sorted
+        descending and NaN-padded, and ``normals`` shape ``(..., max_hits, 3)`` pointing
+        into the sliding mass (``n_z > 0`` on a floor, ``n_z < 0`` on a roof).
+        """
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        zb = self.z(xa, ya)
+        dz_dx, dz_dy = self.gradients(xa, ya)
+        return graph_hits_from_z(zb, dz_dx, dz_dy, max_hits=max_hits)
+
+    def sample_base(
+        self,
+        x: Any,
+        y: Any,
+        z_top: Any,
+        z_min: Any,
+        *,
+        nz_min: float = NZ_FLOOR_MIN,
+    ) -> BaseSample:
+        """Basal hit of a downward ray from ``z_top``, skipping roof-like intersections."""
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        zt = np.broadcast_to(np.asarray(z_top, dtype=float), xa.shape)
+        zm = np.broadcast_to(np.asarray(z_min, dtype=float), xa.shape)
+        z_hits, normals = self.vertical_hits(xa, ya)
+        return pick_floor(z_hits, normals, zt, zm, nz_min=nz_min)
+
+    def intersect_segment(
+        self,
+        a: np.ndarray,
+        b: np.ndarray,
+        n_samples: int = 65,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """First intersection of segment ``a -> b`` with the surface, plus the unit normal."""
+        a = np.asarray(a, dtype=float).reshape(3)
+        b = np.asarray(b, dtype=float).reshape(3)
+        ab = b - a
+        total = float(np.linalg.norm(ab))
+        if total <= 1e-9:
+            return None
+        ts = np.linspace(0.0, 1.0, max(8, int(n_samples)))
+        pts = a[None, :] + ts[:, None] * ab[None, :]
+        z_top = float(np.max(pts[:, 2]) + 1.0)
+        z_min = float(np.min(pts[:, 2]) - 1.0)
+        samp = self.sample_base(pts[:, 0], pts[:, 1], z_top, z_min)
+        diff = pts[:, 2] - samp.z
+        valid = np.isfinite(diff)
+        if int(np.count_nonzero(valid)) < 2:
+            return None
+        for k in range(len(ts) - 1):
+            if valid[k] and valid[k + 1] and diff[k] >= 0.0 and diff[k + 1] < 0.0:
+                denom = diff[k] - diff[k + 1]
+                frac = float(diff[k] / denom) if abs(denom) > 1e-12 else 0.5
+                t_hit = float(ts[k] + frac * (ts[k + 1] - ts[k]))
+                xyz = a + t_hit * ab
+                nrm = samp.normal_xyz[k]
+                if not np.all(np.isfinite(nrm)):
+                    nrm = samp.normal_xyz[k + 1]
+                n_len = float(np.linalg.norm(nrm))
+                if n_len < 1e-12:
+                    return None
+                return xyz, nrm / n_len
+        return None
 
     def rotation_center_sz(self, azimuth_deg: float) -> tuple[float, float] | None:
         """Optional moment-equilibrium axis (s_c, z_c) in the sliding frame."""
@@ -108,10 +198,17 @@ class EllipsoidSurface(SlipSurface3D):
     ry: float
     rz: float
     azimuth_deg: float = 180.0
+    sheet: str = "lower"  # lower | upper | both
 
     def __post_init__(self) -> None:
         if self.rx <= 0 or self.ry <= 0 or self.rz <= 0:
             raise ValueError("Ellipsoid semi-axes rx, ry, rz must all be strictly positive.")
+        if self.sheet not in ("lower", "upper", "both"):
+            raise ValueError("EllipsoidSurface.sheet must be 'lower', 'upper', or 'both'.")
+
+    @property
+    def graph_valued(self) -> bool:  # type: ignore[override]
+        return self.sheet != "both"
 
     @property
     def is_spherical(self) -> bool:
@@ -128,15 +225,49 @@ class EllipsoidSurface(SlipSurface3D):
         v = -dx * sp + dy * cp
         return u, v, cp, sp
 
-    def z(self, x: Any, y: Any) -> np.ndarray:
-        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+    def _sheet_z(self, xa: np.ndarray, ya: np.ndarray, lower: bool) -> np.ndarray:
         u, v, _, _ = self._local_uv(xa, ya)
         rho2 = (u / self.rx) ** 2 + (v / self.ry) ** 2
         inside = rho2 < 1.0 - 1e-12
         out = np.full(xa.shape, np.nan, dtype=float)
         if np.any(inside):
-            out[inside] = self.zc - self.rz * np.sqrt(np.maximum(1.0 - rho2[inside], 0.0))
+            half = self.rz * np.sqrt(np.maximum(1.0 - rho2[inside], 0.0))
+            out[inside] = self.zc - half if lower else self.zc + half
         return out
+
+    def z(self, x: Any, y: Any) -> np.ndarray:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        return self._sheet_z(xa, ya, lower=self.sheet != "upper")
+
+    def _implicit_normal(self, xa: np.ndarray, ya: np.ndarray, za: np.ndarray) -> np.ndarray:
+        """Unit normal pointing into the ellipsoid interior (sliding mass of a scoop)."""
+        u, v, cp, sp = self._local_uv(xa, ya)
+        dF_du = 2.0 * u / (self.rx * self.rx)
+        dF_dv = 2.0 * v / (self.ry * self.ry)
+        dF_dz = 2.0 * (za - self.zc) / (self.rz * self.rz)
+        dF_dx = dF_du * cp - dF_dv * sp
+        dF_dy = dF_du * sp + dF_dv * cp
+        g = np.stack([dF_dx, dF_dy, dF_dz], axis=-1)
+        # F < 0 inside; -∇F points into the interior
+        n = -g
+        ln = np.linalg.norm(n, axis=-1, keepdims=True)
+        return np.where(ln > 1e-14, n / np.maximum(ln, 1e-14), np.nan)
+
+    def vertical_hits(
+        self, x: Any, y: Any, *, max_hits: int = MAX_VERTICAL_HITS
+    ) -> tuple[np.ndarray, np.ndarray]:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        z_lo = self._sheet_z(xa, ya, lower=True)
+        z_hi = self._sheet_z(xa, ya, lower=False)
+        if self.sheet == "lower":
+            n_lo = self._implicit_normal(xa, ya, z_lo)
+            return pack_hits([z_lo], [n_lo], xa.shape, max_hits=max_hits)
+        if self.sheet == "upper":
+            n_hi = self._implicit_normal(xa, ya, z_hi)
+            return pack_hits([z_hi], [n_hi], xa.shape, max_hits=max_hits)
+        n_lo = self._implicit_normal(xa, ya, z_lo)
+        n_hi = self._implicit_normal(xa, ya, z_hi)
+        return pack_hits([z_hi, z_lo], [n_hi, n_lo], xa.shape, max_hits=max_hits)
 
     def gradients(self, x: Any, y: Any, eps: float = 1e-5) -> tuple[np.ndarray, np.ndarray]:
         xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
@@ -151,6 +282,8 @@ class EllipsoidSurface(SlipSurface3D):
             dz_dv = self.rz * v[inside] / (self.ry * self.ry * rad)
             dz_dx[inside] = dz_du * cp - dz_dv * sp
             dz_dy[inside] = dz_du * sp + dz_dv * cp
+        if self.sheet == "upper":
+            return -dz_dx, -dz_dy
         return dz_dx, dz_dy
 
     def rotation_center_sz(self, azimuth_deg: float) -> tuple[float, float]:
@@ -176,6 +309,7 @@ class EllipsoidSurface(SlipSurface3D):
             "ry": float(self.ry),
             "rz": float(self.rz),
             "azimuth_deg": float(self.azimuth_deg),
+            "sheet": self.sheet,
         }
 
 
@@ -337,22 +471,118 @@ class SplinePatchSurface(SlipSurface3D):
 
 @dataclass
 class MeshSlipSurface(SlipSurface3D):
-    """User-defined / imported 3D slip surface interpolated linearly over scattered (x, y, z) vertices."""
+    """User-defined 3D slip surface from scattered vertices, optionally with triangles.
+
+    Without ``faces`` the surface is a heightfield interpolated over ``(x, y)``.
+    With ``faces`` a vertical ray may intersect several sheets (overhangs, folds, closed bowls).
+    """
 
     vertices: np.ndarray
+    faces: np.ndarray | None = None
     _interp: LinearNDInterpolator = field(init=False, repr=False)
+    _z_ray: float = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         pts = np.asarray(self.vertices, dtype=float)
         if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 3 or not np.all(np.isfinite(pts)):
             raise ValueError("MeshSlipSurface requires at least 3 finite (x, y, z) vertices.")
         self.vertices = pts
+        self._z_ray = float(np.max(pts[:, 2]) + max(1.0, 0.05 * np.ptp(pts[:, 2])))
+        if self.faces is not None:
+            faces = np.asarray(self.faces, dtype=np.int64)
+            if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) < 1:
+                raise ValueError("MeshSlipSurface.faces must be an (M, 3) triangle index array.")
+            if int(np.min(faces)) < 0 or int(np.max(faces)) >= len(pts):
+                raise ValueError("MeshSlipSurface.faces indexes a missing vertex.")
+            self.faces = faces
         self._interp = LinearNDInterpolator(pts[:, :2], pts[:, 2], fill_value=np.nan)
+
+    @property
+    def graph_valued(self) -> bool:  # type: ignore[override]
+        return self.faces is None
+
+    @classmethod
+    def from_polydata(cls, mesh: pv.DataSet) -> MeshSlipSurface:
+        surf = mesh.extract_surface().triangulate()
+        pts = np.asarray(surf.points, dtype=float)
+        if surf.n_cells == 0 or len(pts) < 3:
+            raise ValueError("PolyData slip surface has no triangles.")
+        faces_raw = np.asarray(surf.faces, dtype=np.int64).reshape(-1, 4)
+        return cls(vertices=pts, faces=faces_raw[:, 1:4])
 
     def z(self, x: Any, y: Any) -> np.ndarray:
         xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
-        vals = self._interp(xa.ravel(), ya.ravel())
-        return np.asarray(vals, dtype=float).reshape(xa.shape)
+        if self.faces is None:
+            vals = self._interp(xa.ravel(), ya.ravel())
+            return np.asarray(vals, dtype=float).reshape(xa.shape)
+        z_min = float(np.min(self.vertices[:, 2]) - 1.0)
+        return self.sample_base(xa, ya, self._z_ray, z_min).z
+
+    def vertical_hits(
+        self, x: Any, y: Any, *, max_hits: int = MAX_VERTICAL_HITS
+    ) -> tuple[np.ndarray, np.ndarray]:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        if self.faces is None:
+            zb = np.asarray(self._interp(xa.ravel(), ya.ravel()), dtype=float).reshape(xa.shape)
+            dz_dx, dz_dy = super().gradients(xa, ya)
+            return graph_hits_from_z(zb, dz_dx, dz_dy, max_hits=max_hits)
+        return vertical_mesh_hits(
+            xa, ya, self.vertices, self.faces, z_ray=self._z_ray, max_hits=max_hits
+        )
+
+    def intersect_segment(
+        self,
+        a: np.ndarray,
+        b: np.ndarray,
+        n_samples: int = 65,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        if self.faces is None:
+            return super().intersect_segment(a, b, n_samples=n_samples)
+        a = np.asarray(a, dtype=float).reshape(3)
+        b = np.asarray(b, dtype=float).reshape(3)
+        ab = b - a
+        length = float(np.linalg.norm(ab))
+        if length <= 1e-9:
+            return None
+        direction = ab / length
+        xyz, nrm = ray_triangle_hits(
+            a.reshape(1, 3), direction, self.vertices, self.faces, t_min=1e-9, t_max=length
+        )
+        if not np.isfinite(xyz[0, 0, 0]):
+            return None
+        n = nrm[0, 0]
+        n_len = float(np.linalg.norm(n))
+        if n_len < 1e-12:
+            return None
+        if n[2] < 0.0:
+            n = -n
+            n_len = float(np.linalg.norm(n))
+        return xyz[0, 0], n / n_len
+
+    def to_mesh(
+        self,
+        x_bounds: tuple[float, float],
+        y_bounds: tuple[float, float],
+        ground_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
+        nx: int = 72,
+        ny: int = 72,
+    ) -> pv.PolyData:
+        if self.faces is None:
+            return super().to_mesh(x_bounds, y_bounds, ground_fn=ground_fn, nx=nx, ny=ny)
+        n = len(self.faces)
+        faces = np.hstack([np.full((n, 1), 3, dtype=np.int64), self.faces]).ravel()
+        poly = pv.PolyData(self.vertices, faces)
+        x0, x1 = x_bounds
+        y0, y1 = y_bounds
+        in_xy = (
+            (self.vertices[:, 0] >= x0)
+            & (self.vertices[:, 0] <= x1)
+            & (self.vertices[:, 1] >= y0)
+            & (self.vertices[:, 1] <= y1)
+        )
+        if not np.any(in_xy):
+            return pv.PolyData()
+        return poly
 
     def footprint_bounds(self) -> tuple[float, float, float, float]:
         return (
@@ -363,9 +593,93 @@ class MeshSlipSurface(SlipSurface3D):
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "kind": "mesh",
             "vertices": self.vertices.tolist(),
+        }
+        if self.faces is not None:
+            payload["faces"] = self.faces.tolist()
+        return payload
+
+
+@dataclass
+class ImplicitSlipSurface(SlipSurface3D):
+    """General F(x, y, z) = 0 slip manifold sampled by vertical line search.
+
+    ``F < 0`` is treated as the interior / sliding-mass side, so ``n = -∇F / |∇F|``.
+    """
+
+    fn: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]
+    grad_fn: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]
+    bounds: tuple[float, float, float, float, float, float]
+    n_z_scan: int = 48
+    name: str = "implicit"
+    graph_valued: bool = False
+
+    def footprint_bounds(self) -> tuple[float, float, float, float]:
+        return (
+            float(self.bounds[0]),
+            float(self.bounds[1]),
+            float(self.bounds[2]),
+            float(self.bounds[3]),
+        )
+
+    def z(self, x: Any, y: Any) -> np.ndarray:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        return self.sample_base(xa, ya, self.bounds[5], self.bounds[4]).z
+
+    def vertical_hits(
+        self, x: Any, y: Any, *, max_hits: int = MAX_VERTICAL_HITS
+    ) -> tuple[np.ndarray, np.ndarray]:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        x0, x1, y0, y1, z0, z1 = (float(v) for v in self.bounds)
+        inside = (xa >= x0) & (xa <= x1) & (ya >= y0) & (ya <= y1)
+        zs = np.linspace(z1, z0, max(8, int(self.n_z_scan)))
+        layers = [np.asarray(self.fn(xa, ya, np.full(xa.shape, zc)), dtype=float) for zc in zs]
+        f_stack = np.stack(layers, axis=-1)
+        z_hits, normals = empty_hit_buffers(xa.shape, max_hits=max_hits)
+        slot = np.zeros(xa.shape, dtype=int)
+        for k in range(len(zs) - 1):
+            f0 = f_stack[..., k]
+            f1 = f_stack[..., k + 1]
+            crossed = (
+                inside
+                & np.isfinite(f0)
+                & np.isfinite(f1)
+                & (f0 * f1 <= 0.0)
+                & (np.abs(f1 - f0) > 1e-14)
+            )
+            if not np.any(crossed):
+                continue
+            z_root = zs[k] - f0 * (zs[k + 1] - zs[k]) / (f1 - f0)
+            g = np.asarray(self.grad_fn(xa, ya, z_root), dtype=float)
+            if g.shape == xa.shape + (3,):
+                grad = g
+            else:
+                raise ValueError(
+                    "ImplicitSlipSurface.grad_fn must return an array of shape (..., 3)."
+                )
+            ln = np.linalg.norm(grad, axis=-1, keepdims=True)
+            n_into = np.where(ln > 1e-14, -grad / np.maximum(ln, 1e-14), np.nan)
+            use = crossed & (slot < max_hits)
+            if not np.any(use):
+                continue
+            # Write into the current slot per-point (slots may differ)
+            for s in range(max_hits):
+                here = use & (slot == s)
+                if not np.any(here):
+                    continue
+                z_hits[..., s] = np.where(here, z_root, z_hits[..., s])
+                normals[..., s, :] = np.where(here[..., None], n_into, normals[..., s, :])
+            slot = slot + use.astype(int)
+        return z_hits, normals
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "implicit",
+            "name": self.name,
+            "bounds": [float(v) for v in self.bounds],
+            "n_z_scan": int(self.n_z_scan),
         }
 
 
@@ -524,6 +838,7 @@ def surface_from_dict(d: dict[str, Any]) -> SlipSurface3D:
             ry=float(d["ry"]),
             rz=float(d["rz"]),
             azimuth_deg=float(d.get("azimuth_deg", 180.0)),
+            sheet=str(d.get("sheet", "lower")),
         )
     if kind == "composite_ellipsoid_plane":
         return CompositeEllipsoidPlaneSurface(
@@ -546,5 +861,11 @@ def surface_from_dict(d: dict[str, Any]) -> SlipSurface3D:
             bounds=(float(b_raw[0]), float(b_raw[1]), float(b_raw[2]), float(b_raw[3])),
         )
     if kind == "mesh":
-        return MeshSlipSurface(vertices=np.asarray(d["vertices"], dtype=float))
+        faces = d.get("faces")
+        return MeshSlipSurface(
+            vertices=np.asarray(d["vertices"], dtype=float),
+            faces=None if faces is None else np.asarray(faces, dtype=np.int64),
+        )
+    if kind == "implicit":
+        raise ValueError("ImplicitSlipSurface cannot be deserialized from JSON (callable F).")
     raise ValueError(f"Unknown 3D slip surface kind: {kind!r}")
