@@ -362,3 +362,163 @@ def generate_bolt_pattern_3d(
             )
             idx += 1
     return bolts_out
+
+
+@dataclass
+class GeotextileSheet3D:
+    """Horizontal sheet of planar reinforcement (geotextile / geogrid) at elevation ``z``.
+
+    The sheet covers the plan box ``[x1, x2] x [y1, y2]`` and carries tension along
+    ``direction`` ("x" or "y"). It is analysed as parallel strips ``strip_spacing`` wide, so
+    each strip is cut by the slip surface where it actually crosses and takes
+
+        T = min(tensile, pullout * L_anchored, anchorage + pullout * L_in_sliding_mass)
+
+    per metre width, where ``tensile_kn_m`` is the long-term design strength [kN/m],
+    ``pullout_kpa`` the pullout resistance per unit plan area of sheet (both faces together)
+    and ``anchorage_kn_m`` the capacity of the connection at the slope face (0 = free end).
+    """
+
+    name: str = "Geotextile 1"
+    x1: float = 0.0
+    x2: float = 10.0
+    y1: float = 0.0
+    y2: float = 10.0
+    z: float = 0.0
+    tensile_kn_m: float = 50.0
+    pullout_kpa: float = 20.0
+    anchorage_kn_m: float = 0.0
+    direction: str = "x"
+    strip_spacing: float = 1.0
+    application: str = "passive"
+
+    def __post_init__(self) -> None:
+        if self.x2 < self.x1:
+            self.x1, self.x2 = self.x2, self.x1
+        if self.y2 < self.y1:
+            self.y1, self.y2 = self.y2, self.y1
+        if self.direction not in ("x", "y"):
+            raise ValueError(f"{self.name}: direction must be 'x' or 'y'.")
+        if self.application not in ("active", "passive"):
+            raise ValueError(f"{self.name}: application must be 'active' or 'passive'.")
+        if self.x2 - self.x1 <= 1e-9 or self.y2 - self.y1 <= 1e-9:
+            raise ValueError(f"{self.name}: the sheet needs a non-zero plan area.")
+        if self.strip_spacing <= 0 or min(self.tensile_kn_m, self.pullout_kpa) < 0:
+            raise ValueError(f"{self.name}: spacing must be > 0 and strengths >= 0.")
+        if self.anchorage_kn_m < 0:
+            raise ValueError(f"{self.name}: anchorage capacity must be >= 0.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> GeotextileSheet3D:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+    def to_bolts(self, ground_z_fn: Callable[[Any, Any], np.ndarray]) -> list[Bolt3D]:
+        """Expand into strip elements; each strip's head is its end nearest the slope face."""
+        along_x = self.direction == "x"
+        width = (self.y2 - self.y1) if along_x else (self.x2 - self.x1)
+        n_strips = max(1, int(round(width / self.strip_spacing)))
+        w_strip = width / n_strips
+        strip_type = SupportType3D(
+            name=f"{self.name} strip",
+            kind="geotextile",
+            tensile_kn=self.tensile_kn_m * w_strip,
+            plate_kn=self.anchorage_kn_m * w_strip,
+            bond_strength_kn_m=self.pullout_kpa * w_strip,
+            bond_length_m=0.0,
+            application=self.application,
+            color="#0ea5e9",
+        )
+        bolts: list[Bolt3D] = []
+        for i in range(n_strips):
+            offset = (i + 0.5) * w_strip
+            if along_x:
+                a = (self.x1, self.y1 + offset, self.z)
+                b = (self.x2, self.y1 + offset, self.z)
+            else:
+                a = (self.x1 + offset, self.y1, self.z)
+                b = (self.x1 + offset, self.y2, self.z)
+            # The face end is the one with less soil cover above the sheet.
+            cover_a = float(np.asarray(ground_z_fn(a[0], a[1])).ravel()[0]) - self.z
+            cover_b = float(np.asarray(ground_z_fn(b[0], b[1])).ravel()[0]) - self.z
+            head, tip = (a, b) if cover_a <= cover_b else (b, a)
+            bolts.append(
+                Bolt3D(
+                    head_xyz=head,
+                    tip_xyz=tip,
+                    support_type=strip_type,
+                    label=f"{self.name} strip {i + 1}",
+                )
+            )
+        return bolts
+
+
+@dataclass
+class PileRow3D:
+    """Row of vertical stabilising piles between ``(x1, y1)`` and ``(x2, y2)``.
+
+    Piles start at the ground surface and are ``length_m`` long. A pile cut by the slip
+    surface resists sliding with ``shear_kn`` along the base of the column it crosses; piles
+    that do not reach below the slip surface contribute nothing.
+    """
+
+    name: str = "Pile Row 1"
+    x1: float = 0.0
+    y1: float = 0.0
+    x2: float = 0.0
+    y2: float = 10.0
+    spacing: float = 2.0
+    length_m: float = 12.0
+    shear_kn: float = 150.0
+    application: str = "passive"
+
+    def __post_init__(self) -> None:
+        if self.spacing <= 0 or self.length_m <= 0 or self.shear_kn < 0:
+            raise ValueError(f"{self.name}: spacing and length must be > 0, shear >= 0.")
+        if self.application not in ("active", "passive"):
+            raise ValueError(f"{self.name}: application must be 'active' or 'passive'.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> PileRow3D:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+    def pile_positions(self) -> np.ndarray:
+        """Plan (x, y) of every pile, evenly spaced and centred on the row."""
+        row_len = float(np.hypot(self.x2 - self.x1, self.y2 - self.y1))
+        n_piles = int(np.floor(row_len / self.spacing + 1e-9)) + 1
+        if n_piles == 1 or row_len < 1e-9:
+            return np.array([[0.5 * (self.x1 + self.x2), 0.5 * (self.y1 + self.y2)]])
+        margin = 0.5 * (row_len - (n_piles - 1) * self.spacing)
+        t = (margin + np.arange(n_piles) * self.spacing) / row_len
+        return np.column_stack(
+            [self.x1 + t * (self.x2 - self.x1), self.y1 + t * (self.y2 - self.y1)]
+        )
+
+    def to_bolts(self, ground_z_fn: Callable[[Any, Any], np.ndarray]) -> list[Bolt3D]:
+        pile_type = SupportType3D(
+            name=f"{self.name} pile",
+            kind="micropile",
+            tensile_kn=0.0,
+            plate_kn=0.0,
+            bond_strength_kn_m=0.0,
+            pile_shear_kn=self.shear_kn,
+            application=self.application,
+            color="#64748b",
+        )
+        bolts: list[Bolt3D] = []
+        for i, (px, py) in enumerate(self.pile_positions(), 1):
+            z_head = float(np.asarray(ground_z_fn(float(px), float(py))).ravel()[0])
+            bolts.append(
+                Bolt3D(
+                    head_xyz=(float(px), float(py), z_head),
+                    tip_xyz=(float(px), float(py), z_head - self.length_m),
+                    support_type=pile_type,
+                    label=f"{self.name} pile {i}",
+                )
+            )
+        return bolts

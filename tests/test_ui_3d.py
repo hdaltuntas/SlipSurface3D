@@ -230,3 +230,127 @@ def test_design_standard_multimodal_and_new_material_pages(qapp, tmp_path: Path)
     assert pdf.stat().st_size > 5000
     win.viewport.cleanup()
     win.close()
+
+
+def test_weak_layers_piezo_dialog_and_viewport(qapp, tmp_path: Path):
+    import numpy as np
+
+    from slipsurface3d.project import MaterialSpec3D
+    from slipsurface3d.scripting import create_simple_slope_project
+    from slipsurface3d.ui.dialogs import WeakLayersPiezoDialog
+
+    proj = create_simple_slope_project(methods=("bishop",), effort="fast")
+    proj.materials[0].use_water = True
+    proj.materials.append(MaterialSpec3D(name="Slick", c=0.0, phi=12.0, color="#f43f5e"))
+
+    dlg = WeakLayersPiezoDialog(proj)
+    dlg.add_planar_weak_layer(4.0, 5.0, 180.0, material="Slick")
+    name = dlg.add_planar_piezo_surface(9.0)
+    dlg.assign_piezo("Slope Soil", name)
+    dlg.pz_table.item(0, 0).setText("Perched")
+    csv_path = tmp_path / "u.csv"
+    csv_path.write_text("x,y,z,u\n0,0,0,50\n10,0,0,40\n0,10,0,45\n0,0,5,5\n10,10,5,0\n")
+    from slipsurface3d.porewater import read_pore_pressure_csv
+
+    dlg.set_pore_grid(read_pore_pressure_csv(csv_path))
+    assert "5 samples" in dlg.grid_label.text()
+    dlg._on_accept()
+    dlg.apply_to_project(proj)
+    assert proj.weak_layers[0].material == "Slick"
+    assert proj.piezo_surfaces[0][0] == "Perched"
+    assert proj.materials[0].piezo == "Perched"  # assignment follows the rename
+    assert len(proj.pore_grid) == 5
+    proj.validate()
+
+    # Removing the surface clears the assignment that pointed at it
+    dlg2 = WeakLayersPiezoDialog(proj)
+    dlg2.pz_table.setCurrentCell(0, 0)
+    dlg2._remove_piezo()
+    dlg2._on_accept()
+    assert dlg2.material_piezo["Slope Soil"] == ""
+    dlg2.done(0)
+
+    win = MainWindow3D(proj)
+    win.show()
+    qapp.processEvents()
+    win.compute_analysis(synchronous=True)
+    assert win.results is not None and win.results.primary_result.ok
+    assert float(np.max(win.results.columns.u)) > 0.0
+    shot = tmp_path / "layers.png"
+    win.viewport.export_screenshot(str(shot))
+    assert shot.stat().st_size > 2000
+    saved = tmp_path / "layers.slp3d.json"
+    win.project.save(saved)
+    assert len(Project3D.load(saved).weak_layers) == 1
+    win.viewport.cleanup()
+    win.close()
+
+
+def test_supports_stages_dialogs_and_stage_display(qapp, tmp_path: Path):
+    from slipsurface3d.project import MaterialSpec3D
+    from slipsurface3d.scripting import create_simple_slope_project
+    from slipsurface3d.ui.dialogs import (
+        StagedAnalysisDialog,
+        SupportsStagesDialog,
+        WeakLayersPiezoDialog,
+    )
+
+    proj = create_simple_slope_project(methods=("bishop",), effort="fast")
+    proj.materials.append(MaterialSpec3D(name="Fill", c=5.0, phi=32.0, use_water=False))
+
+    dlg = SupportsStagesDialog(proj)
+    dlg._add_geotextile()
+    dlg._add_pile_row()
+    dlg._add_stage()
+    dlg._add_stage()
+    # Second stage: a crest fill in the "Fill" material
+    kind_cb = dlg.stage_table.cellWidget(1, 1)
+    kind_cb.setCurrentIndex(kind_cb.findText("fill"))
+    mat_cb = dlg.stage_table.cellWidget(1, 8)
+    mat_cb.setCurrentIndex(mat_cb.findText("Fill"))
+    for col, text in ((2, "45"), (3, "59"), (6, "15")):
+        dlg.stage_table.item(1, col).setText(text)
+    from slipsurface3d.loads.supports import GeotextileSheet3D
+
+    dlg.geo_table.item(0, 6).setText("not a number")
+    try:
+        dlg.geo_table.records(GeotextileSheet3D, GeotextileSheet3D())
+        raise AssertionError("a non-numeric cell must be rejected")
+    except ValueError as exc:
+        assert "Row 1" in str(exc) and "Tensile" in str(exc)
+    dlg.geo_table.item(0, 6).setText("75,5")  # decimal comma is accepted
+    dlg._on_accept()
+    dlg.apply_to_project(proj)
+    assert proj.geotextiles[0].tensile_kn_m == 75.5
+    assert len(proj.pile_rows) == 1
+    assert [s.kind for s in proj.stages] == ["excavation", "fill"]
+    assert proj.stages[1].fill_material == "Fill" and proj.stages[1].level == 15.0
+    proj.validate()
+
+    # Weak-layer seam thickness is editable in its table
+    ldlg = WeakLayersPiezoDialog(proj)
+    ldlg.add_planar_weak_layer(3.0, material="Fill")
+    ldlg.wl_table.item(0, 2).setText("0.25")
+    ldlg._on_accept()
+    assert ldlg.weak_layers[0].thickness == 0.25
+    ldlg.done(0)
+
+    win = MainWindow3D(proj)
+    win.show()
+    qapp.processEvents()
+    sdlg = StagedAnalysisDialog(proj, win)
+    sdlg.run_stages()
+    assert sdlg.table.rowCount() == 3
+    assert all(sr.results is not None for sr in sdlg.stage_results)
+    sdlg.table.selectRow(2)
+    sdlg._show_selected()
+    assert sdlg.selected is not None and sdlg.selected.name == "Stage 2"
+    win.show_stage_result(sdlg.selected)
+    assert win.results is sdlg.selected.results
+    assert float(win.results.model.ground_z(52.0, 20.0)) == 15.0
+    shot = tmp_path / "stage.png"
+    win.viewport.export_screenshot(str(shot))
+    assert shot.stat().st_size > 2000
+    assert len(win.project.stages) == 2  # showing a stage does not alter the project
+    win.viewport.cleanup()
+    win.close()

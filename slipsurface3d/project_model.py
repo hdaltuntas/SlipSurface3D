@@ -7,6 +7,7 @@ import datetime as _dt
 import json
 import os
 import tempfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,20 +28,24 @@ from slipsurface3d.geometry.terrain import (
     ExtrudedProfileRegion,
     HorizonSurface,
     SlopeModel3D,
+    WeakLayer3D,
     horizons_from_boreholes,
 )
 from slipsurface3d.lem.columns import GAMMA_W, ColumnOptions
 from slipsurface3d.lem.solvers import INTERCOLUMN_FUNCTIONS, M_ALPHA_MIN_DEFAULT, METHODS_3D
 from slipsurface3d.loads.supports import (
     Bolt3D,
+    GeotextileSheet3D,
     LoadSet3D,
     PatchLoad3D,
+    PileRow3D,
     PointLoad3D,
     SupportType3D,
     TensionCrack3D,
 )
 from slipsurface3d.materials.models import MODEL_LABELS, Material3D, material_from_spec_dict
-from slipsurface3d.optimizer.search import EFFORT_PRESETS, SearchSettings3D
+from slipsurface3d.optimizer.search import EFFORT_PRESETS, SEARCH_ALGORITHMS, SearchSettings3D
+from slipsurface3d.porewater import PorePressureGrid3D
 from slipsurface3d.seepage import SeepageBC3D, solve_seepage_3d
 
 FORMAT_3D = "slipsurface-3d"
@@ -93,6 +98,8 @@ class MaterialSpec3D:
     hu: float = 1.0
     bbar: float = 0.0
     excess_load: bool = False
+    # Piezometric surface used for this material's pore pressure ("" = global water table)
+    piezo: str = ""
     color: str = PALETTE_3D[0]
 
     # Mohr-Coulomb
@@ -173,7 +180,7 @@ class AnalysisSettings3D:
     max_iter: int = 75
     sliding_mode: str = "auto"  # auto | right_to_left | left_to_right | custom
     azimuth_deg: float = 180.0
-    pore_mode: str = "water_table"  # water_table | ru | none
+    pore_mode: str = "water_table"  # water_table | ru | seepage | grid | none
     gamma_w: float = GAMMA_W
     ru: float = 0.0
     kh: float = 0.0
@@ -192,6 +199,7 @@ class SurfaceConfig3D:
     surface_kind: str = "ellipsoid"  # sphere | ellipsoid | spline_patch | wedge
     effort: str = "normal"  # fast | normal | fine
     primary_method: str = "bishop"
+    algorithm: str = "cuckoo"  # cuckoo | pso
     optimize_azimuth: bool = False
     sao_enabled: bool = False
     seed: int = 42
@@ -202,6 +210,52 @@ class SurfaceConfig3D:
     n_local_minima: int = 1
     # Plan search limits [x_min, x_max, y_min, y_max] the sliding mass must stay inside
     search_limits: list[float] | None = None
+
+
+@dataclass
+class Stage3D:
+    """A construction stage: a box excavation or fill battered back to the existing ground.
+
+    Inside the plan box the ground is cut down to (``excavation``) or built up to (``fill``)
+    ``level``. Outside it the new surface rises (or falls) at ``batter`` horizontal to
+    1 vertical until it meets the existing ground.
+    """
+
+    name: str = "Stage 1"
+    kind: str = "excavation"  # excavation | fill
+    x1: float = 0.0
+    x2: float = 10.0
+    y1: float = 0.0
+    y2: float = 10.0
+    level: float = 0.0
+    batter: float = 1.5
+    fill_material: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("excavation", "fill"):
+            raise ValueError(f"{self.name}: stage kind must be 'excavation' or 'fill'.")
+        if self.x2 < self.x1:
+            self.x1, self.x2 = self.x2, self.x1
+        if self.y2 < self.y1:
+            self.y1, self.y2 = self.y2, self.y1
+        if self.batter < 0.0:
+            raise ValueError(f"{self.name}: batter (H:V) must be >= 0.")
+
+    def target_z(self, x: Any, y: Any) -> np.ndarray:
+        """Elevation of the stage's cut / fill surface before merging with the ground."""
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        dx = np.maximum(np.maximum(self.x1 - xa, xa - self.x2), 0.0)
+        dy = np.maximum(np.maximum(self.y1 - ya, ya - self.y2), 0.0)
+        dist = np.hypot(dx, dy)
+        rise = dist / self.batter if self.batter > 1e-9 else np.where(dist > 0.0, np.inf, 0.0)
+        return self.level + rise if self.kind == "excavation" else self.level - rise
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Stage3D:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
@@ -229,6 +283,13 @@ class Project3D:
     analysis: AnalysisSettings3D = field(default_factory=AnalysisSettings3D)
     surface_config: SurfaceConfig3D = field(default_factory=SurfaceConfig3D)
     design: DesignFactors3D = field(default_factory=DesignFactors3D)
+    weak_layers: list[WeakLayer3D] = field(default_factory=list)
+    piezo_surfaces: list[tuple[str, HorizonSurface]] = field(default_factory=list)
+    # Scattered pore-pressure samples [[x, y, z, u_kPa], ...] used when pore_mode == "grid"
+    pore_grid: list[list[float]] = field(default_factory=list)
+    geotextiles: list[GeotextileSheet3D] = field(default_factory=list)
+    pile_rows: list[PileRow3D] = field(default_factory=list)
+    stages: list[Stage3D] = field(default_factory=list)
 
     def copy(self) -> Project3D:
         return copy.deepcopy(self)
@@ -284,8 +345,33 @@ class Project3D:
             raise ValueError("Column grid requires nx >= 3, ny >= 1, n_sub >= 4.")
         if a.tolerance <= 0 or a.max_iter < 1:
             raise ValueError("Solver tolerance > 0 and max_iter >= 1 required.")
-        if a.pore_mode not in ("water_table", "ru", "seepage", "none"):
+        if a.pore_mode not in ("water_table", "ru", "seepage", "grid", "none"):
             raise ValueError(f"Unknown pore_mode: {a.pore_mode!r}.")
+        if a.pore_mode == "grid":
+            if not self.pore_grid:
+                raise ValueError("pore_mode='grid' requires imported pore-pressure samples.")
+            PorePressureGrid3D(self.pore_grid)
+        for stage in self.stages:
+            if stage.kind == "fill":
+                if stage.fill_material and stage.fill_material not in names:
+                    raise ValueError(
+                        f"Stage '{stage.name}': fill material {stage.fill_material!r} is not defined."
+                    )
+                if self.profile_regions:
+                    raise ValueError(
+                        f"Stage '{stage.name}': fills need a layered model, not extruded 2D regions."
+                    )
+        for wl in self.weak_layers:
+            if wl.material not in names:
+                raise ValueError(
+                    f"Weak layer '{wl.name}': material {wl.material!r} is not defined."
+                )
+        piezo_names = [n for n, _ in self.piezo_surfaces]
+        if len(set(piezo_names)) != len(piezo_names) or "" in piezo_names:
+            raise ValueError("Piezometric surface names must be unique and non-empty.")
+        for m in self.materials:
+            if m.piezo and m.piezo not in piezo_names:
+                raise ValueError(f"{m.name}: piezometric surface {m.piezo!r} is not defined.")
         if a.gamma_w <= 0 or not 0.0 <= a.ru <= 1.0:
             raise ValueError("Require gamma_w > 0 and 0 <= ru <= 1.")
         if a.kh < 0 or not -1.0 < a.kv < 1.0:
@@ -304,6 +390,8 @@ class Project3D:
             raise ValueError(f"Unknown surface_kind: {sc.surface_kind!r}.")
         if sc.effort not in EFFORT_PRESETS:
             raise ValueError(f"Unknown search effort: {sc.effort!r}.")
+        if sc.algorithm not in SEARCH_ALGORITHMS:
+            raise ValueError(f"Unknown search algorithm: {sc.algorithm!r}.")
         if sc.primary_method not in METHODS_3D:
             raise ValueError(f"Unknown primary search method: {sc.primary_method!r}.")
         if not 1 <= sc.n_local_minima <= 12:
@@ -345,6 +433,8 @@ class Project3D:
             profile_regions=list(self.profile_regions),
             water_table=self.water_table,
             name=self.summary.title,
+            weak_layers=list(self.weak_layers),
+            piezo_surfaces=dict(self.piezo_surfaces),
         )
 
     def build_materials(self) -> list[Material3D]:
@@ -367,6 +457,14 @@ class Project3D:
                     label=str(b.get("label", f"Bolt {i}")),
                 )
             )
+        if self.geotextiles or self.pile_rows:
+            if self.ground is None and self.boreholes:
+                self.rebuild_from_boreholes()
+            assert self.ground is not None
+            for sheet in self.geotextiles:
+                bolt_objs.extend(sheet.to_bolts(self.ground.z))
+            for row in self.pile_rows:
+                bolt_objs.extend(row.to_bolts(self.ground.z))
         loads = LoadSet3D(
             patch_loads=list(self.patch_loads),
             point_loads=list(self.point_loads),
@@ -378,9 +476,11 @@ class Project3D:
     def build_column_options(self, kv_override: float | None = None) -> ColumnOptions:
         a = self.analysis
         pore = a.pore_mode
-        pore_fn = None
-        if pore == "water_table" and self.water_table is None:
+        pore_fn: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray] | None = None
+        if pore == "water_table" and self.water_table is None and not self.piezo_surfaces:
             pore = "none"
+        elif pore == "grid":
+            pore_fn = PorePressureGrid3D(self.pore_grid)
         elif pore == "seepage":
             seep_grid = solve_seepage_3d(self.build_model(), bc=self.seepage_bc, gamma_w=a.gamma_w)
             pore_fn = seep_grid.pore_pressure_at
@@ -408,6 +508,7 @@ class Project3D:
             surface_kind=sc.surface_kind,
             effort=sc.effort,
             primary_method=sc.primary_method,
+            algorithm=sc.algorithm,
             optimize_azimuth=sc.optimize_azimuth,
             sao_enabled=sc.sao_enabled,
             n_workers=self.analysis.n_workers,
@@ -470,6 +571,14 @@ class Project3D:
             "analysis": asdict(self.analysis),
             "surface_config": asdict(self.surface_config),
             "design": self.design.to_dict(),
+            "weak_layers": [wl.to_dict() for wl in self.weak_layers],
+            "piezo_surfaces": [
+                {"name": name, "horizon": hor.to_dict()} for name, hor in self.piezo_surfaces
+            ],
+            "pore_grid": [[float(v) for v in row] for row in self.pore_grid],
+            "geotextiles": [g.to_dict() for g in self.geotextiles],
+            "pile_rows": [r.to_dict() for r in self.pile_rows],
+            "stages": [s.to_dict() for s in self.stages],
         }
 
     @classmethod
@@ -540,6 +649,15 @@ class Project3D:
             analysis=AnalysisSettings3D(**an_raw),
             surface_config=SurfaceConfig3D(**sc_raw),
             design=DesignFactors3D.from_dict(d.get("design")),
+            weak_layers=[WeakLayer3D.from_dict(w) for w in d.get("weak_layers", [])],
+            piezo_surfaces=[
+                (str(item["name"]), HorizonSurface.from_dict(item["horizon"]))
+                for item in d.get("piezo_surfaces", [])
+            ],
+            pore_grid=[[float(v) for v in row] for row in d.get("pore_grid", [])],
+            geotextiles=[GeotextileSheet3D.from_dict(g) for g in d.get("geotextiles", [])],
+            pile_rows=[PileRow3D.from_dict(r) for r in d.get("pile_rows", [])],
+            stages=[Stage3D.from_dict(s) for s in d.get("stages", [])],
         )
         proj.validate()
         return proj

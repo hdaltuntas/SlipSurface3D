@@ -14,7 +14,11 @@ from dataclasses import dataclass, field
 import numpy as np
 import pyvista as pv
 
-from slipsurface3d.geometry.surfaces import MultiPlaneWedgeSurface, SlipSurface3D
+from slipsurface3d.geometry.surfaces import (
+    MultiPlaneWedgeSurface,
+    SlipSurface3D,
+    WeakLayerClippedSurface,
+)
 from slipsurface3d.geometry.terrain import SlopeModel3D
 from slipsurface3d.loads.supports import LoadSet3D
 from slipsurface3d.materials.models import Material3D
@@ -410,6 +414,17 @@ def _tight_active_bounds(
     return ax0, ax1, ay0, ay1
 
 
+def clip_to_weak_layers(model: SlopeModel3D, surface: SlipSurface3D) -> SlipSurface3D:
+    """Wrap ``surface`` so it follows the model's weak layers where it would pass below them."""
+    if not model.weak_layers or isinstance(surface, WeakLayerClippedSurface):
+        return surface
+    return WeakLayerClippedSurface(
+        base=surface,
+        layers=[(wl.material, wl.horizon) for wl in model.weak_layers],
+        thicknesses=[wl.thickness for wl in model.weak_layers],
+    )
+
+
 def discretize_columns(
     model: SlopeModel3D,
     surface: SlipSurface3D,
@@ -423,6 +438,8 @@ def discretize_columns(
         raise ValueError("At least one Material3D is required.")
     mat_names = [m.name for m in materials]
     colors = material_colors or ["#d9a441"] * len(materials)
+    kinematic_surface = surface.base if isinstance(surface, WeakLayerClippedSurface) else surface
+    surface = clip_to_weak_layers(model, surface)
 
     ax0, ax1, ay0, ay1 = _tight_active_bounds(model, surface)
     nx = max(2, int(opts.nx))
@@ -535,8 +552,10 @@ def discretize_columns(
         az_deg = 0.0
     elif opts.sliding_mode == "custom":
         az_deg = float(opts.azimuth_deg) % 360.0
-    elif isinstance(surface, MultiPlaneWedgeSurface) and len(surface.planes) >= 2:
-        az_deg = surface.kinematic_azimuth_deg()
+    elif isinstance(kinematic_surface, MultiPlaneWedgeSurface) and (
+        len(kinematic_surface.planes) >= 2
+    ):
+        az_deg = kinematic_surface.kinematic_azimuth_deg()
     else:
         # Auto: area/height-weighted downhill basal gradient -sum(h * grad(z_b))
         w_tmp = h_grid[active_mask]
@@ -634,6 +653,13 @@ def discretize_columns(
     # Basal material index (just inside the column above z_base)
     mat_idx = model.material_indices_at(x, y, zb + np.minimum(1e-4, 0.02 * h), mat_names)
 
+    # Column bases riding on a weak layer take that layer's strength material
+    if isinstance(surface, WeakLayerClippedSurface):
+        governing = surface.strength_layer(x, y)
+        for k_layer, (layer_mat, _horizon) in enumerate(surface.layers):
+            if layer_mat in mat_names:
+                mat_idx = np.where(governing == k_layer, mat_names.index(layer_mat), mat_idx)
+
     infinite = np.array([m.infinite_strength for m in materials], dtype=bool)
     if np.any(infinite[mat_idx]):
         raise ColumnDiscretizationError(
@@ -649,8 +675,28 @@ def discretize_columns(
     bbar_arr = np.array([m.bbar for m in materials], dtype=float)
     total_stress_arr = np.array([m.total_stress for m in materials], dtype=bool)
 
-    if z_wt is not None and opts.pore_mode == "water_table":
-        submerged = z_samples <= z_wt[:, None]
+    # Which column sub-samples are below water, and the water level above each column top.
+    # A material with its own piezometric surface uses it; the others use the water table.
+    submerged: np.ndarray | None = None
+    level_top: np.ndarray | None = None
+    if opts.pore_mode == "water_table" and (z_wt is not None or model.piezo_surfaces):
+        level = np.full(z_samples.shape, -np.inf, dtype=float)
+        if z_wt is not None:
+            level[:] = z_wt[:, None]
+        for m_i, mat in enumerate(materials):
+            piezo = model.piezo_surfaces.get(mat.piezo) if mat.piezo else None
+            if piezo is not None:
+                level = np.where(mat_sub == m_i, np.asarray(piezo.z(x, y))[:, None], level)
+        submerged = z_samples <= level
+        level_top = level[:, -1]
+    elif opts.pore_mode == "grid" and opts.pore_pressure_fn is not None:
+        # Saturated wherever the supplied pore-pressure field is positive
+        x_b = np.broadcast_to(x[:, None], z_samples.shape)
+        y_b = np.broadcast_to(y[:, None], z_samples.shape)
+        # (small tolerance: interpolation round-off leaves ~1e-13 kPa above the water level)
+        submerged = np.asarray(opts.pore_pressure_fn(x_b, y_b, z_samples), dtype=float) > 1e-6
+
+    if submerged is not None:
         gam_samples = np.where(submerged, gamma_sat[mat_sub], gamma_dry[mat_sub])
     else:
         gam_samples = gamma_dry[mat_sub]
@@ -664,8 +710,8 @@ def discretize_columns(
 
     # Ponded water above ground surface (when water_table mode & z_wt > z_top)
     W_pond = np.zeros(n_cols, dtype=float)
-    if z_wt is not None and opts.pore_mode == "water_table":
-        h_pond = np.maximum(z_wt - zt, 0.0)
+    if level_top is not None:
+        h_pond = np.where(np.isfinite(level_top), np.maximum(level_top - zt, 0.0), 0.0)
         W_pond = opts.gamma_w * h_pond * dA
 
     W = W_soil + W_pond
@@ -673,10 +719,8 @@ def discretize_columns(
     # Excess vertical stress from overlying excess_load materials (for B-bar)
     if np.any(excess_flags):
         is_exc = excess_flags[mat_sub]
-        if z_wt is not None and opts.pore_mode == "water_table":
-            gam_eff_exc = np.where(
-                z_samples <= z_wt[:, None], gam_samples - opts.gamma_w, gam_samples
-            )
+        if submerged is not None:
+            gam_eff_exc = np.where(submerged, gam_samples - opts.gamma_w, gam_samples)
         else:
             gam_eff_exc = gam_samples
         dsig_exc = np.sum(np.where(is_exc, np.maximum(gam_eff_exc, 0.0), 0.0), axis=1) * dh
@@ -742,12 +786,21 @@ def discretize_columns(
     if opts.pore_pressure_fn is not None and opts.pore_mode in (
         "seepage",
         "seepage_grid",
+        "grid",
         "water_table",
     ):
         u_eval = np.maximum(np.asarray(opts.pore_pressure_fn(x, y, zb), dtype=float), 0.0)
         u_base = np.where(use_water[mat_idx], hu_arr[mat_idx] * u_eval, 0.0)
-    elif opts.pore_mode == "water_table" and z_wt is not None:
-        head = np.maximum(z_wt - zb, 0.0)
+    elif opts.pore_mode == "water_table" and (z_wt is not None or model.piezo_surfaces):
+        head = np.maximum(z_wt - zb, 0.0) if z_wt is not None else np.zeros(n_cols, dtype=float)
+        # Materials assigned their own piezometric surface use it instead of the water table
+        for m_i, mat in enumerate(materials):
+            piezo = model.piezo_surfaces.get(mat.piezo) if mat.piezo else None
+            if piezo is None:
+                continue
+            own = mat_idx == m_i
+            if np.any(own):
+                head = np.where(own, np.maximum(piezo.z(x, y) - zb, 0.0), head)
         u_base = np.where(use_water[mat_idx], hu_arr[mat_idx] * opts.gamma_w * head, 0.0)
     elif opts.pore_mode == "ru":
         sigma_pre = np.maximum(sigma_v_soil - dsig_exc, 0.0)

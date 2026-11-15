@@ -42,15 +42,10 @@ from slipsurface3d.exchange import (
     export_esri_ascii_dem,
     export_obj_mesh,
     export_stl_mesh,
-    import_dxf_3d_vertices,
-    import_esri_ascii_dem,
-    import_obj_horizon,
+    import_horizon_file,
     import_obj_slip_surface,
-    import_stl_horizon,
     import_stl_slip_surface,
-    import_xyz_csv_horizon,
 )
-from slipsurface3d.geometry.terrain import HorizonSurface
 from slipsurface3d.lem.solvers import METHODS_3D
 from slipsurface3d.project import (
     EXAMPLE_PROJECTS_3D,
@@ -70,6 +65,9 @@ from slipsurface3d.ui.dialogs import (
     ParametricSlopeDialog,
     ProbabilisticSensitivity3DDialog,
     SeismicNewmark3DDialog,
+    StagedAnalysisDialog,
+    SupportsStagesDialog,
+    WeakLayersPiezoDialog,
 )
 from slipsurface3d.ui.preferences import ABOUT_HTML, apply_theme, current_theme, push_recent_file
 from slipsurface3d.ui.viewport3d import SCALAR_FIELD_OPTIONS, Viewport3D
@@ -251,6 +249,14 @@ class MainWindow3D(QMainWindow):
         self.act_loads.triggered.connect(self.edit_loads_supports)
         mod_m.addAction(self.act_loads)
 
+        self.act_layers = QAction("Weak Layers, Piezometric Surfaces & Pore Pressure Grid...", self)
+        self.act_layers.triggered.connect(self.edit_weak_layers_piezo)
+        mod_m.addAction(self.act_layers)
+
+        self.act_supports_stages = QAction("Geotextiles, Pile Rows & Construction Stages...", self)
+        self.act_supports_stages.triggered.connect(self.edit_supports_stages)
+        mod_m.addAction(self.act_supports_stages)
+
         # Analysis Menu
         an_m = mb.addMenu("&Analysis")
         self.act_settings = QAction("Solvers, Columns & Slip Surface Settings...", self)
@@ -285,6 +291,10 @@ class MainWindow3D(QMainWindow):
         self.act_seismic = QAction("Seismic ky & Newmark Displacement...", self)
         self.act_seismic.triggered.connect(self.open_seismic_dialog)
         an_m.addAction(self.act_seismic)
+
+        self.act_stages = QAction("Run Construction Stages...", self)
+        self.act_stages.triggered.connect(self.open_staged_analysis_dialog)
+        an_m.addAction(self.act_stages)
 
         self.act_section2d = QAction("2D Cross-Section & F3D/F2D Comparison...", self)
         self.act_section2d.triggered.connect(self.open_cross_section_dialog)
@@ -723,6 +733,44 @@ class MainWindow3D(QMainWindow):
             self.results = None
             self._refresh_all(reset_camera=False)
 
+    def edit_weak_layers_piezo(self) -> None:
+        dlg = WeakLayersPiezoDialog(self.project, self)
+        if dlg.exec():
+            self._push_undo()
+            dlg.apply_to_project(self.project)
+            if not self.project.pore_grid and self.project.analysis.pore_mode == "grid":
+                self.project.analysis.pore_mode = "water_table"
+            self.results = None
+            self._refresh_all(reset_camera=False)
+
+    def edit_supports_stages(self) -> None:
+        dlg = SupportsStagesDialog(self.project, self)
+        if dlg.exec():
+            self._push_undo()
+            dlg.apply_to_project(self.project)
+            self.results = None
+            self._refresh_all(reset_camera=False)
+
+    def open_staged_analysis_dialog(self) -> None:
+        if not self.project.stages:
+            QMessageBox.information(
+                self,
+                "Construction Stages",
+                "Define stages first under Model → Geotextiles, Pile Rows & Construction Stages.",
+            )
+            return
+        dlg = StagedAnalysisDialog(self.project, self)
+        if dlg.exec() and dlg.selected is not None:
+            self.show_stage_result(dlg.selected)
+
+    def show_stage_result(self, stage: Any) -> None:
+        """Display one stage's geometry and results; the project itself is not changed."""
+        self.results = stage.results
+        self._refresh_all(reset_camera=False)
+        self.statusBar().showMessage(
+            f"Showing stage '{stage.name}'. Recompute (F9) to return to the initial ground."
+        )
+
     def edit_analysis_settings(self) -> None:
         dlg = AnalysisSurfaceDialog(self.project, self)
         if dlg.exec():
@@ -889,19 +937,7 @@ class MainWindow3D(QMainWindow):
         if not fn:
             return
         try:
-            p = Path(fn)
-            ext = p.suffix.lower()
-            if ext == ".obj":
-                hor = import_obj_horizon(p, name=p.stem)
-            elif ext == ".stl":
-                hor = import_stl_horizon(p, name=p.stem)
-            elif ext == ".asc":
-                hor = import_esri_ascii_dem(p, name=p.stem)
-            elif ext in (".csv", ".xyz"):
-                hor = import_xyz_csv_horizon(p, name=p.stem)
-            else:
-                pts = import_dxf_3d_vertices(p)
-                hor = HorizonSurface.from_scattered(pts, name=p.stem)
+            hor = import_horizon_file(fn)
 
             if hor.x_coords is not None and hor.y_coords is not None and hor.z_grid is not None:
                 x0, x1 = float(hor.x_coords[0]), float(hor.x_coords[-1])

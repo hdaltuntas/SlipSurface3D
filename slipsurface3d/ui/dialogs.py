@@ -8,6 +8,7 @@ from slipsurface3d.ui.dialogs_advanced import (
     SeismicNewmark3DDialog,
 )
 from slipsurface3d.ui.dialogs_analysis import AnalysisSurfaceDialog, ColumnDataDialog
+from slipsurface3d.ui.dialogs_layers import WeakLayersPiezoDialog
 from slipsurface3d.ui.dialogs_model import (
     BoreholesDialog,
     Import2DExtrusionDialog,
@@ -15,6 +16,7 @@ from slipsurface3d.ui.dialogs_model import (
     Materials3DDialog,
     ParametricSlopeDialog,
 )
+from slipsurface3d.ui.dialogs_stages import StagedAnalysisDialog, SupportsStagesDialog
 from slipsurface3d.ui.forms import _dspin
 
 __all__ = [
@@ -28,5 +30,8 @@ __all__ = [
     "ParametricSlopeDialog",
     "ProbabilisticSensitivity3DDialog",
     "SeismicNewmark3DDialog",
+    "StagedAnalysisDialog",
+    "SupportsStagesDialog",
+    "WeakLayersPiezoDialog",
     "_dspin",
 ]

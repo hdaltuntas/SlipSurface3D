@@ -22,6 +22,18 @@ Standalone 3D companion to SlipSurfaceIQ-LE. Licensed under GNU AGPL v3 or later
 - `surface_config.n_local_minima` reports up to 12 distinct critical surfaces (plan footprints overlapping by less than half), ranked by FoS and drawn in the viewport, the text summary and the PDF report. Secondary modes are sampled less densely than the global minimum, so their FoS is an upper bound on the local minimum.
 - `surface_config.search_limits` restricts the sliding mass to a plan box.
 
+## Weak layers and pore-water options
+- Weak layers (`Project3D.weak_layers`) defined by any single-valued surface: a plane, DEM, STL/OBJ mesh or XYZ points. A slip surface that would pass below a weak layer is clipped to run along it (`WeakLayerClippedSurface`) and the column bases on it take the layer's strength material. Applies to user surfaces and to every search trial. An optional seam `thickness` also applies the weak strength to slip surfaces passing through the band above the layer surface; with it the Zhang (1988) weak-seam case is reproduced to 0.1%. Weak layers never change unit weights.
+- Per-material piezometric surfaces: a material can take its basal pore pressure from a named piezometric surface instead of the global water table. Saturated unit weights and ponded water follow the same surface, so a piezometric surface and an identical water table give identical results.
+- Scattered pore-pressure grid (`pore_mode = "grid"`): `x, y, z, u` samples from an external seepage analysis or piezometers, linearly interpolated inside the samples and taken from the nearest sample outside; the analysis warns when column bases fall outside the samples. Soil is saturated wherever the interpolated pressure is positive. Keep negative pressures above the phreatic surface in the samples so the zero-pressure line is located exactly. Water standing above the ground is not represented by a grid.
+- New dialog: Model → Weak Layers, Piezometric Surfaces & Pore Pressure Grid.
+
+## Areal supports, construction stages and particle swarm
+- Geotextile / geogrid sheets (`GeotextileSheet3D`): horizontal reinforcement analysed strip by strip, limited by tensile strength, pullout over the anchored length, and face anchorage plus pullout inside the sliding mass.
+- Pile rows (`PileRow3D`): vertical piles from the ground surface that resist with their shear capacity where they pass through the slip surface.
+- Construction stages (`Stage3D`, `slipsurface3d.stages`): box excavations and fills applied cumulatively, with a fill material inserted above the previous ground. `run_staged_analysis_3d` analyses the initial ground and each stage; Analysis → Run Construction Stages lists the results and shows any stage in the viewport. Each stage is an independent limit-equilibrium analysis with the same water table, loads and supports.
+- Particle Swarm global search (`surface_config.algorithm = "pso"`) as an alternative to Cuckoo Search.
+
 ## Groundwater, seismic, reliability
 - 3D steady-state anisotropic seepage Laplace solver $\nabla \cdot (\mathbf{K}\nabla H) = 0$ with atmospheric seepage-face breakout.
 - Critical yield acceleration $k_y$ ($F_s(k_y) = 1.0$) and Newmark permanent displacement (Jibson 2007, Ambraseys & Menu 1988, accelerogram double integration).

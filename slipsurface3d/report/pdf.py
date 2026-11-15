@@ -238,6 +238,8 @@ def export_pdf_report_3d(
                 body_style,
             )
         )
+    for warning in results.warnings:
+        story.append(Paragraph(f"<b>Warning:</b> {warning}", body_style))
     if len(results.local_minima) > 1:
         modes = "; ".join(
             f"#{i} {results.result_label} {lm.fos:.3f} "

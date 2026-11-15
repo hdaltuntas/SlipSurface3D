@@ -31,6 +31,7 @@ from slipsurface3d.lem.columns import (
     ColumnDiscretizationError,
     ColumnGrid,
     ColumnOptions,
+    clip_to_weak_layers,
     discretize_columns,
 )
 from slipsurface3d.lem.solvers import M_ALPHA_MIN_DEFAULT, LEMResult3D, solve_surface_3d
@@ -45,12 +46,21 @@ EFFORT_PRESETS: dict[str, tuple[int, int, int]] = {
 
 PENALTY_FOS = 1.0e6
 
+SEARCH_ALGORITHMS: dict[str, str] = {
+    "cuckoo": "Cuckoo Search",
+    "pso": "Particle Swarm",
+}
+# Clerc & Kennedy (2002) constriction coefficients
+PSO_INERTIA = 0.7298
+PSO_ACCEL = 1.4962
+
 
 @dataclass
 class SearchSettings3D:
     surface_kind: str = "ellipsoid"  # sphere | ellipsoid | spline_patch | user
     effort: str = "normal"  # fast | normal | fine
     primary_method: str = "bishop"
+    algorithm: str = "cuckoo"  # cuckoo | pso (global stage; both end with Nelder-Mead polish)
     optimize_azimuth: bool = False
     sao_enabled: bool = False
     n_workers: int = 1  # 1 = serial, 0 = auto multi-core, >=2 = explicit worker threads
@@ -70,11 +80,12 @@ class SearchSettings3D:
 class LocalMinimum3D:
     """One of several distinct critical surfaces found by the multi-modal search."""
 
-    surface: SlipSurface3D
+    surface: SlipSurface3D  # as analysed (clipped to weak layers when the model has any)
     fos: float
     volume: float
     azimuth_deg: float
     centroid_xy: tuple[float, float]
+    source_surface: SlipSurface3D | None = None  # the search surface before clipping
 
 
 @dataclass
@@ -299,7 +310,8 @@ def _find_local_minima(
         weights = cols.h * cols.dA
         total = float(np.sum(weights))
         return LocalMinimum3D(
-            surface=surface,
+            surface=cols.surface,
+            source_surface=surface,
             fos=fos,
             volume=cols.total_volume,
             azimuth_deg=cols.azimuth_deg,
@@ -646,10 +658,54 @@ def search_critical_surface_3d(
                 best_fos,
             )
 
+        # Particle Swarm state (Clerc-Kennedy constriction): nests double as personal bests
+        use_pso = settings.algorithm == "pso"
+        pos = nests.copy()
+        vel = (rng.random((n_nests, dim)) - 0.5) * 0.2 * span
+        v_max = 0.25 * span
+
         for gen in range(n_gen):
             if cancel_check is not None and cancel_check():
                 cancelled = True
                 break
+
+            if use_pso:
+                r1 = rng.random((n_nests, dim))
+                r2 = rng.random((n_nests, dim))
+                vel = PSO_INERTIA * vel + PSO_ACCEL * (
+                    r1 * (nests - pos) + r2 * (best_vec[None, :] - pos)
+                )
+                vel = np.clip(vel, -v_max, v_max)
+                pos = pos + vel
+                # Reflect at the bounds so particles do not pile up on the walls
+                below, above = pos < lo, pos > hi
+                pos = np.where(below, 2.0 * lo - pos, np.where(above, 2.0 * hi - pos, pos))
+                pos = np.clip(pos, lo, hi)
+                vel = np.where(below | above, -0.5 * vel, vel)
+                pso_fits = eval_batch([pos[i] for i in range(n_nests)], fine=False, pool=pool_ctx)
+                improved_pso = False
+                for i, f_c in enumerate(pso_fits):
+                    if f_c < fit[i]:
+                        nests[i] = pos[i]
+                        fit[i] = f_c
+                        if f_c < best_fos:
+                            best_fos = f_c
+                            best_vec = pos[i].copy()
+                            best_idx = i
+                            improved_pso = True
+                # Re-seed particles that have never found a valid surface
+                for i in range(n_nests):
+                    if fit[i] >= PENALTY_FOS:
+                        pos[i] = lo + rng.random(dim) * span
+                        vel[i] = (rng.random(dim) - 0.5) * 0.2 * span
+                if improved_pso and best_surface_cb is not None and best_fos < PENALTY_FOS:
+                    best_surface_cb(
+                        _decode_surface(best_vec, base_kind, default_az, settings.optimize_azimuth),
+                        best_fos,
+                    )
+                if progress_cb is not None:
+                    progress_cb(gen + 1, n_gen, best_fos)
+                continue
 
             # Lévy flights evaluated in parallel batch
             levy_cands: list[np.ndarray] = []
@@ -818,11 +874,13 @@ def search_critical_surface_3d(
         eval_count += extra_evals
         # A refined secondary mode can undercut the main search: promote it to critical.
         local_minima.sort(key=lambda m: m.fos)
-        if local_minima[0].surface is not crit_surface:
-            promoted = _finalize(local_minima[0].surface)
+        top_source = local_minima[0].source_surface
+        if top_source is not None and top_source is not crit_surface:
+            promoted = _finalize(top_source)
             if promoted is not None:
-                crit_surface = local_minima[0].surface
+                crit_surface = top_source
                 crit_cols = promoted[0]
+                local_minima[0].surface = crit_cols.surface
                 crit_res = solve_surface_3d(
                     crit_cols,
                     method=settings.primary_method,
@@ -912,7 +970,7 @@ def compute_safety_map_3d(
         sub_x = xx[ix0:ix1, iy0:iy1]
         sub_y = yy[ix0:ix1, iy0:iy1]
         sub_zg = zg[ix0:ix1, iy0:iy1]
-        zb = surf.sample_base(sub_x, sub_y, sub_zg, model.z_min).z
+        zb = clip_to_weak_layers(model, surf).sample_base(sub_x, sub_y, sub_zg, model.z_min).z
         active = np.isfinite(zb) & ((sub_zg - zb) >= min_depth)
         if not np.any(active):
             continue

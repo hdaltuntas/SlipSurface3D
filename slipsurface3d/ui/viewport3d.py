@@ -278,6 +278,32 @@ class Viewport3D(QWidget):
             if wt is not None:
                 pl.add_mesh(wt, color="#3b82f6", opacity=0.35, smooth_shading=True)
 
+        # Weak layers (material colour) and piezometric surfaces (cyan wireframe)
+        for wl in proj.weak_layers:
+            wl_grid = wl.horizon.to_mesh(model.x_bounds, model.y_bounds, nx=60, ny=44)
+            # Only the part of the layer that is actually buried is meaningful
+            pts = np.asarray(wl_grid.points)
+            buried = pts[:, 2] <= np.asarray(model.ground_z(pts[:, 0], pts[:, 1])) + 1e-6
+            wl_grid["Buried"] = buried.astype(float)
+            wl_mesh = wl_grid.threshold(0.5, scalars="Buried", preference="point")
+            if wl_mesh.n_cells == 0:
+                continue
+            pl.add_mesh(
+                wl_mesh,
+                color=mat_colors.get(wl.material, "#f43f5e"),
+                opacity=0.55,
+                show_edges=True,
+                edge_color=wire_col,
+                line_width=0.5,
+                pickable=False,
+            )
+        if self._show_water:
+            for _pz_name, pz_hor in proj.piezo_surfaces:
+                pz_mesh = pz_hor.to_mesh(model.x_bounds, model.y_bounds, nx=30, ny=22)
+                pl.add_mesh(
+                    pz_mesh, color="#22d3ee", style="wireframe", opacity=0.6, pickable=False
+                )
+
         # 3. External patch loads, point loads & 3D bolts
         if self._show_loads_supports:
             for p_ld in proj.patch_loads:
@@ -296,6 +322,25 @@ class Viewport3D(QWidget):
                     start = np.array([pt_ld.x, pt_ld.y, pt_ld.z]) - scale * u_dir
                     arr = pv.Arrow(start=start, direction=u_dir, scale=scale)
                     pl.add_mesh(arr, color="#ef4444")
+
+            # Geotextile sheets as translucent panels, pile rows as vertical bars
+            for sheet in proj.geotextiles:
+                panel = pv.Plane(
+                    center=(0.5 * (sheet.x1 + sheet.x2), 0.5 * (sheet.y1 + sheet.y2), sheet.z),
+                    direction=(0.0, 0.0, 1.0),
+                    i_size=sheet.x2 - sheet.x1,
+                    j_size=sheet.y2 - sheet.y1,
+                )
+                pl.add_mesh(panel, color="#0ea5e9", opacity=0.45, show_edges=True, pickable=False)
+            for row in proj.pile_rows:
+                for px, py in row.pile_positions():
+                    z_head = float(model.ground_z(float(px), float(py)))
+                    pl.add_mesh(
+                        pv.Line((px, py, z_head), (px, py, z_head - row.length_m)),
+                        color="#cbd5e1",
+                        line_width=4.0,
+                        pickable=False,
+                    )
 
             for b in proj.bolts:
                 head = np.asarray(b["head"], dtype=float)

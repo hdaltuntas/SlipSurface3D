@@ -497,6 +497,47 @@ def build_2d_profile_regions(
 
 
 @dataclass
+class WeakLayer3D:
+    """A weak surface (bedding plane, shear zone, liner) with its own strength material.
+
+    Any slip surface that would dip below ``horizon`` is clipped to run along it, and the
+    column bases lying on it take the strength of ``material``.
+
+    ``thickness`` models a seam of finite thickness lying on top of ``horizon``: a slip
+    surface passing through the band ``[horizon, horizon + thickness]`` without reaching the
+    bottom also takes the weak strength there. With ``thickness = 0`` only bases that run
+    along the layer itself are weak. Unit weights are never changed by a weak layer; give
+    the seam its own stratum if its density matters.
+    """
+
+    name: str
+    material: str
+    horizon: HorizonSurface
+    thickness: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.thickness) or self.thickness < 0.0:
+            raise ValueError(f"Weak layer '{self.name}': thickness must be >= 0.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "material": self.material,
+            "horizon": self.horizon.to_dict(),
+            "thickness": float(self.thickness),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> WeakLayer3D:
+        return cls(
+            name=str(d.get("name", "Weak Layer")),
+            material=str(d["material"]),
+            horizon=HorizonSurface.from_dict(d["horizon"]),
+            thickness=float(d.get("thickness", 0.0)),
+        )
+
+
+@dataclass
 class SlopeModel3D:
     """Three-dimensional geotechnical slope geometry and stratigraphy.
 
@@ -518,6 +559,9 @@ class SlopeModel3D:
     profile_regions: list[ExtrudedProfileRegion] = field(default_factory=list)
     water_table: HorizonSurface | None = None
     name: str = "3D Slope Model"
+    weak_layers: list[WeakLayer3D] = field(default_factory=list)
+    # Named piezometric surfaces that individual materials can use instead of the water table
+    piezo_surfaces: dict[str, HorizonSurface] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.x_max <= self.x_min:
@@ -618,6 +662,8 @@ class SlopeModel3D:
             self.ground.kind == "scattered"
             or any(h.kind == "scattered" for _, h in self.layers)
             or (self.water_table is not None and self.water_table.kind == "scattered")
+            or any(wl.horizon.kind == "scattered" for wl in self.weak_layers)
+            or any(h.kind == "scattered" for h in self.piezo_surfaces.values())
         )
         if not has_scattered:
             return self
@@ -647,6 +693,16 @@ class SlopeModel3D:
             profile_regions=list(self.profile_regions),
             water_table=wt_fast,
             name=self.name,
+            weak_layers=[
+                WeakLayer3D(
+                    name=wl.name,
+                    material=wl.material,
+                    horizon=_bake(wl.horizon),
+                    thickness=wl.thickness,
+                )
+                for wl in self.weak_layers
+            ],
+            piezo_surfaces={k: _bake(h) for k, h in self.piezo_surfaces.items()},
         )
 
     def ground_mesh(self, nx: int = 64, ny: int = 44) -> pv.StructuredGrid:

@@ -47,6 +47,8 @@ class Material3D(ABC):
     total_stress: bool = False
     # Slip surfaces may not pass through an infinite-strength material (bedrock, concrete).
     infinite_strength: bool = False
+    # Name of the piezometric surface giving this material's pore pressure ("" = water table)
+    piezo: str = ""
     # Design-standard partial factors dividing the cohesive and frictional strength terms.
     pf_c: float = 1.0
     pf_tanphi: float = 1.0
@@ -533,6 +535,7 @@ def material_from_spec_dict(d: dict[str, Any]) -> Material3D:
         hu=float(d.get("hu", 1.0)),
         bbar=float(d.get("bbar", 0.0)),
         excess_load=bool(d.get("excess_load", False)),
+        piezo=str(d.get("piezo", "") or ""),
     )
     if model in ("MC", "HS"):
         return MohrCoulomb3D(c=float(d.get("c", 10.0)), phi=float(d.get("phi", 30.0)), **common)

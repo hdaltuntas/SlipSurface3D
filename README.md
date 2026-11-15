@@ -15,13 +15,19 @@
   - **3D General Limit Equilibrium / Morgenstern-Price (`gle_mp`)** — strip-wise intercolumn functions (`constant`, `half-sine`, `clipped-sine`, `trapezoidal`)
   - **3D Cheng & Yip (2007) Asymmetric Equilibrium (`cheng_yip`)** — solves $\sum F_s = 0$, $\sum F_t = 0$, and $\sum M = 0$ simultaneously for oblique 3D sliding azimuth $\psi^*$
 - **Global Search, Multi-Scale SAO & Slope-Wide Safety Maps (`slipsurface3d/optimizer/`)**:
-  - Multi-core parallel Cuckoo Search + Nelder-Mead polish + **Multi-Scale Surface Altering Optimization (`SAO: 3×3 → 5×5` bicubic spline refinement)**
+  - Multi-core parallel Cuckoo Search or Particle Swarm + Nelder-Mead polish + **Multi-Scale Surface Altering Optimization (`SAO: 3×3 → 5×5` bicubic spline refinement)**
   - **3D Slope-Wide Safety Map (`SafetyMap3D`)** projecting all trial slip bowls onto ground topography
   - **Multi-modal search** (`n_local_minima`): reports several distinct failure modes ranked by FoS, each refined inside its own plan footprint and drawn in the viewport
   - **Plan search limits** (`search_limits`) confining the sliding mass to an `[x_min, x_max, y_min, y_max]` box
 - **Design Standards & Strength Models (`slipsurface3d/design.py`, `slipsurface3d/materials/`)**:
   - **Partial-factor design** with Eurocode 7 presets (DA1-C1, DA1-C2, DA2, DA3) or user-defined factors on unit weight, variable loads, $c'$, $\tan\varphi'$, $c_u$, support resistance and earth resistance; results are then reported as over-design factors (ODF)
   - 12 strength models, including a **tabulated shear/normal function** and an **infinite-strength** material that slip surfaces may not cross
+- **Weak Layers & Pore-Water Options**:
+  - **Weak layers along any surface** (`WeakLayer3D`: plane, DEM, STL/OBJ, XYZ), with optional seam thickness: slip surfaces that would pass below a layer are clipped to run along it and take its strength material there, in both user-surface and search modes
+  - **Per-material piezometric surfaces** (`piezo_surfaces`, `MaterialSpec3D.piezo`) and **scattered pore-pressure grids** (`pore_mode = "grid"`, `x, y, z, u` CSV import)
+- **Areal Supports & Construction Stages**:
+  - **Geotextile / geogrid sheets** and **pile rows** (`GeotextileSheet3D`, `PileRow3D`) cut individually by the 3D slip surface
+  - **Staged excavations and fills** (`Stage3D`, `run_staged_analysis_3d`) with a factor of safety per stage
 - **Probabilistic Reliability, Seismic $k_y$/Newmark & 3D Seepage**:
   - **Latin Hypercube & Monte Carlo 3D Reliability** ($P_f$, $\beta_N$, $\beta_{LN}$) & **Tornado Sensitivity** (`slipsurface3d/probabilistic.py`)
   - **Critical Yield Acceleration $k_y$** ($F_s(k_y) = 1.0$) & **Newmark Permanent Displacement** (Jibson 2007, Ambraseys & Menu 1988, and exact accelerogram double integration in `slipsurface3d/seismic.py`)

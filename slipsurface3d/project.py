@@ -20,6 +20,7 @@ from slipsurface3d.project_model import (
     MaterialSpec3D,
     Project3D,
     ProjectSummary3D,
+    Stage3D,
     SurfaceConfig3D,
 )
 
@@ -32,6 +33,7 @@ __all__ = [
     "MaterialSpec3D",
     "Project3D",
     "ProjectSummary3D",
+    "Stage3D",
     "SurfaceConfig3D",
     "extruded_acads_1a_project",
     "hungr_1987_hemisphere_project",

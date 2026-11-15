@@ -18,6 +18,7 @@ from slipsurface3d.optimizer.search import (
     compute_safety_map_3d,
     search_critical_surface_3d,
 )
+from slipsurface3d.porewater import PorePressureGrid3D
 from slipsurface3d.project import Project3D
 
 
@@ -34,6 +35,7 @@ class AnalysisResults3D:
     local_minima: list[LocalMinimum3D] = field(default_factory=list)
     result_label: str = "FoS"
     design_summary: str = ""
+    warnings: list[str] = field(default_factory=list)
     evaluations: int = 0
     elapsed_s: float = 0.0
     cancelled: bool = False
@@ -95,6 +97,7 @@ def _run_for_kv(
         evals = sr.evaluations
         cancelled = sr.cancelled
 
+    surf = cols.surface  # clipped to weak layers when the model has any
     method_results: dict[str, LEMResult3D] = {}
     for meth in an.methods:
         method_results[meth] = solve_surface_3d(
@@ -115,6 +118,15 @@ def _run_for_kv(
         min_depth=an.min_depth,
     )
 
+    warnings: list[str] = []
+    if an.pore_mode == "grid" and project.pore_grid:
+        inside = PorePressureGrid3D(project.pore_grid).coverage(cols.x, cols.y, cols.z_base)
+        if inside < 0.999:
+            warnings.append(
+                f"{100.0 * (1.0 - inside):.0f}% of the column bases lie outside the "
+                "pore-pressure samples; the nearest sample was used there (extrapolation)."
+            )
+
     elapsed = time.perf_counter() - t0
     return AnalysisResults3D(
         model=model,
@@ -128,6 +140,7 @@ def _run_for_kv(
         local_minima=local_minima,
         result_label=project.design.result_label,
         design_summary=project.design.summary() if project.design.active else "",
+        warnings=warnings,
         evaluations=evals,
         elapsed_s=elapsed,
         cancelled=cancelled,
@@ -211,6 +224,8 @@ def report_text_3d(project: Project3D, res: AnalysisResults3D) -> str:
             lines.append(f"  * Admissibility note: {r.issue}")
         if r.message:
             lines.append(f"  * Solver message: {r.message}")
+    for warning in res.warnings:
+        lines.append(f"WARNING: {warning}")
     if len(res.local_minima) > 1:
         lines.append("-" * 72)
         lines.append(f"Distinct critical surfaces ({METHODS_3D[res.primary_method][0]}):")

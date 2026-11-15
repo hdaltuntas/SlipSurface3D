@@ -40,6 +40,7 @@ from slipsurface3d.geometry.surfaces import (
     WedgePlane3D,
 )
 from slipsurface3d.lem.solvers import INTERCOLUMN_FUNCTIONS, METHODS_3D
+from slipsurface3d.optimizer.search import SEARCH_ALGORITHMS
 from slipsurface3d.project import Project3D
 from slipsurface3d.seepage import SeepageBC3D
 from slipsurface3d.ui.forms import _dspin
@@ -118,7 +119,7 @@ class AnalysisSurfaceDialog(QDialog):
         w_gs = QWidget()
         fgs = QFormLayout(w_gs)
         self.pore_cb = QComboBox()
-        self.pore_cb.addItems(["water_table", "ru", "seepage", "none"])
+        self.pore_cb.addItems(["water_table", "ru", "seepage", "grid", "none"])
         self.pore_cb.setCurrentText(an.pore_mode)
         self.ru_sp = _dspin(0.0, 1.0, an.ru, 3, 0.05)
         sbc = project.seepage_bc or SeepageBC3D()
@@ -154,6 +155,10 @@ class AnalysisSurfaceDialog(QDialog):
         self.effort_cb = QComboBox()
         self.effort_cb.addItems(["fast", "normal", "fine"])
         self.effort_cb.setCurrentText(sc.effort)
+        self.algo_cb = QComboBox()
+        for a_key, a_label in SEARCH_ALGORITHMS.items():
+            self.algo_cb.addItem(a_label, a_key)
+        self.algo_cb.setCurrentIndex(max(0, self.algo_cb.findData(sc.algorithm)))
         self.opt_az_chk = QCheckBox("Co-optimize ellipsoid horizontal orientation")
         self.opt_az_chk.setChecked(sc.optimize_azimuth)
         self.sao_chk = QCheckBox("Enable Multi-Scale SAO (3×3 -> 5×5 spline refinement)")
@@ -198,6 +203,7 @@ class AnalysisSurfaceDialog(QDialog):
         fsf.addRow("Surface Mode:", self.mode_cb)
         fsf.addRow("Surface / Search Geometry:", self.kind_cb)
         fsf.addRow("Search Effort:", self.effort_cb)
+        fsf.addRow("Global Search Algorithm:", self.algo_cb)
         fsf.addRow("", self.opt_az_chk)
         fsf.addRow("", self.sao_chk)
         fsf.addRow("Distinct Critical Surfaces:", self.n_minima_sp)
@@ -320,6 +326,14 @@ class AnalysisSurfaceDialog(QDialog):
         an.sliding_mode = self.slide_cb.currentText()
         an.azimuth_deg = self.az_sp.value()
         an.check_admissibility = self.adm_chk.isChecked()
+        if self.pore_cb.currentText() == "grid" and not self._project.pore_grid:
+            QMessageBox.warning(
+                self,
+                "Analysis Settings",
+                "Pore mode 'grid' needs pore-pressure samples. Import them under "
+                "Model → Weak Layers, Piezometric Surfaces & Pore Pressure Grid.",
+            )
+            return
         an.pore_mode = self.pore_cb.currentText()
         an.ru = self.ru_sp.value()
         an.kh = self.kh_sp.value()
@@ -337,6 +351,7 @@ class AnalysisSurfaceDialog(QDialog):
         if sc.surface_kind == "wedge":
             sc.mode = "user"
         sc.effort = self.effort_cb.currentText()
+        sc.algorithm = str(self.algo_cb.currentData())
         sc.primary_method = str(self.primary_cb.currentData() or selected[0])
         sc.optimize_azimuth = self.opt_az_chk.isChecked()
         sc.sao_enabled = self.sao_chk.isChecked()

@@ -66,6 +66,27 @@ def import_obj_horizon(path: str | Path, name: str = "Imported OBJ Terrain") -> 
     return HorizonSurface.from_scattered(pts, name=name)
 
 
+HORIZON_FILE_FILTER = "3D Terrain / GIS (*.obj *.dxf *.stl *.asc *.csv *.xyz)"
+
+
+def import_horizon_file(path: str | Path, name: str | None = None) -> HorizonSurface:
+    """Read a single-valued surface from OBJ, STL, ESRI ASCII DEM, XYZ/CSV or 3D DXF."""
+    p = Path(path)
+    label = name or p.stem
+    ext = p.suffix.lower()
+    if ext == ".obj":
+        return import_obj_horizon(p, name=label)
+    if ext == ".stl":
+        return import_stl_horizon(p, name=label)
+    if ext == ".asc":
+        return import_esri_ascii_dem(p, name=label)
+    if ext in (".csv", ".xyz"):
+        return import_xyz_csv_horizon(p, name=label)
+    if ext == ".dxf":
+        return HorizonSurface.from_scattered(import_dxf_3d_vertices(p), name=label)
+    raise ValueError(f"Unsupported surface file type '{ext}'.")
+
+
 def import_obj_slip_surface(path: str | Path) -> MeshSlipSurface:
     verts: list[list[float]] = []
     faces: list[list[int]] = []

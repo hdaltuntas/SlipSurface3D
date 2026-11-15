@@ -393,6 +393,96 @@ class CompositeEllipsoidPlaneSurface(SlipSurface3D):
 
 
 @dataclass
+class WeakLayerClippedSurface(SlipSurface3D):
+    """A slip surface clipped so it never dips below a set of weak-layer surfaces.
+
+    ``z_b(x, y) = max(z_base(x, y), z_layer_1(x, y), ...)`` inside the base footprint: where
+    the base surface would pass under a weak layer, the slip surface runs along the layer
+    instead. ``layers`` holds ``(material_name, horizon)`` pairs; ``governing_layer`` tells
+    which one, if any, carries each point so the column base can take that layer's strength.
+    """
+
+    base: SlipSurface3D
+    layers: list[tuple[str, Any]] = field(default_factory=list)
+    gradient_step: float = 0.02
+    # Seam thickness above each layer surface (same order as ``layers``; missing = 0)
+    thicknesses: list[float] = field(default_factory=list)
+
+    def _stack(self, xa: np.ndarray, ya: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (z_base, highest layer z, index of that layer or -1)."""
+        zb = self.base.z(xa, ya)
+        z_top = np.full(xa.shape, -np.inf, dtype=float)
+        idx = np.full(xa.shape, -1, dtype=int)
+        for k, (_mat, horizon) in enumerate(self.layers):
+            zl = np.asarray(horizon.z(xa, ya), dtype=float)
+            higher = np.isfinite(zl) & (zl > z_top)
+            z_top = np.where(higher, zl, z_top)
+            idx = np.where(higher, k, idx)
+        return zb, z_top, idx
+
+    def z(self, x: Any, y: Any) -> np.ndarray:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        zb, z_top, _ = self._stack(xa, ya)
+        return np.where(np.isfinite(zb), np.maximum(zb, z_top), np.nan)
+
+    def governing_layer(self, x: Any, y: Any) -> np.ndarray:
+        """Index into ``layers`` of the weak layer the surface follows at (x, y), else -1."""
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        zb, z_top, idx = self._stack(xa, ya)
+        return np.where(np.isfinite(zb) & (z_top > zb), idx, -1)
+
+    def strength_layer(self, x: Any, y: Any) -> np.ndarray:
+        """Index of the weak layer whose strength applies at the slip surface, else -1.
+
+        That is the layer the surface runs along, or failing that a layer whose seam band
+        ``[z_layer, z_layer + thickness]`` contains the slip surface.
+        """
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        out = self.governing_layer(xa, ya)
+        z_slip = self.z(xa, ya)
+        for k, (_mat, horizon) in enumerate(self.layers):
+            thick = float(self.thicknesses[k]) if k < len(self.thicknesses) else 0.0
+            if thick <= 0.0:
+                continue
+            zl = np.asarray(horizon.z(xa, ya), dtype=float)
+            in_band = (out < 0) & np.isfinite(zl) & (z_slip >= zl) & (z_slip <= zl + thick)
+            out = np.where(in_band, k, out)
+        return out
+
+    def gradients(self, x: Any, y: Any, eps: float = 1e-5) -> tuple[np.ndarray, np.ndarray]:
+        xa, ya = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        dz_dx, dz_dy = self.base.gradients(xa, ya, eps=eps)
+        gov = self.governing_layer(xa, ya)
+        h = self.gradient_step
+        for k, (_mat, horizon) in enumerate(self.layers):
+            on_k = gov == k
+            if not np.any(on_k):
+                continue
+            xk, yk = xa[on_k], ya[on_k]
+            gx = (horizon.z(xk + h, yk) - horizon.z(xk - h, yk)) / (2.0 * h)
+            gy = (horizon.z(xk, yk + h) - horizon.z(xk, yk - h)) / (2.0 * h)
+            dz_dx = np.array(dz_dx, dtype=float, copy=True)
+            dz_dy = np.array(dz_dy, dtype=float, copy=True)
+            dz_dx[on_k] = gx
+            dz_dy[on_k] = gy
+        return dz_dx, dz_dy
+
+    def rotation_center_sz(self, azimuth_deg: float) -> tuple[float, float] | None:
+        return self.base.rotation_center_sz(azimuth_deg)
+
+    def footprint_bounds(self) -> tuple[float, float, float, float]:
+        return self.base.footprint_bounds()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "weak_layer_clipped",
+            "base": self.base.to_dict(),
+            "layers": [{"material": mat, "horizon": hor.to_dict()} for mat, hor in self.layers],
+            "thicknesses": [float(t) for t in self.thicknesses],
+        }
+
+
+@dataclass
 class SplinePatchSurface(SlipSurface3D):
     """Non-ellipsoidal 3D slip surface parameterized by a tensor-product control grid.
 
@@ -862,6 +952,17 @@ def surface_from_dict(d: dict[str, Any]) -> SlipSurface3D:
             plane_z0=float(d.get("plane_z0", 0.0)),
             dip_deg=float(d.get("dip_deg", 0.0)),
             dip_dir_deg=float(d.get("dip_dir_deg", 180.0)),
+        )
+    if kind == "weak_layer_clipped":
+        from slipsurface3d.geometry.terrain import HorizonSurface
+
+        return WeakLayerClippedSurface(
+            base=surface_from_dict(d["base"]),
+            layers=[
+                (str(item["material"]), HorizonSurface.from_dict(item["horizon"]))
+                for item in d.get("layers", [])
+            ],
+            thicknesses=[float(t) for t in d.get("thicknesses", [])],
         )
     if kind == "spline_patch":
         return SplinePatchSurface(
