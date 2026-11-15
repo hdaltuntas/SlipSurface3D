@@ -30,12 +30,13 @@ from slipsurface3d.geometry.intersection import (
     MAX_VERTICAL_HITS,
     NZ_FLOOR_MIN,
     BaseSample,
+    VerticalMeshIndex,
     empty_hit_buffers,
     graph_hits_from_z,
+    orient_triangles,
     pack_hits,
     pick_floor,
     ray_triangle_hits,
-    vertical_mesh_hits,
 )
 
 
@@ -475,12 +476,19 @@ class MeshSlipSurface(SlipSurface3D):
 
     Without ``faces`` the surface is a heightfield interpolated over ``(x, y)``.
     With ``faces`` a vertical ray may intersect several sheets (overhangs, folds, closed bowls).
+
+    Triangle winding decides which hits are floors (``n_z > 0``) and which are roofs, and
+    imported files have no reliable convention, so ``auto_orient`` rewinds the triangles
+    (see ``orient_triangles``): closed meshes inward, open meshes to a net upward normal.
+    Set ``auto_orient=False`` to keep the supplied winding verbatim.
     """
 
     vertices: np.ndarray
     faces: np.ndarray | None = None
+    auto_orient: bool = True
     _interp: LinearNDInterpolator = field(init=False, repr=False)
     _z_ray: float = field(init=False, repr=False)
+    _index: VerticalMeshIndex | None = field(init=False, repr=False, default=None)
 
     def __post_init__(self) -> None:
         pts = np.asarray(self.vertices, dtype=float)
@@ -494,7 +502,8 @@ class MeshSlipSurface(SlipSurface3D):
                 raise ValueError("MeshSlipSurface.faces must be an (M, 3) triangle index array.")
             if int(np.min(faces)) < 0 or int(np.max(faces)) >= len(pts):
                 raise ValueError("MeshSlipSurface.faces indexes a missing vertex.")
-            self.faces = faces
+            self.faces = orient_triangles(pts, faces) if self.auto_orient else faces
+            self._index = VerticalMeshIndex(pts, self.faces)
         self._interp = LinearNDInterpolator(pts[:, :2], pts[:, 2], fill_value=np.nan)
 
     @property
@@ -503,7 +512,7 @@ class MeshSlipSurface(SlipSurface3D):
 
     @classmethod
     def from_polydata(cls, mesh: pv.DataSet) -> MeshSlipSurface:
-        surf = mesh.extract_surface().triangulate()
+        surf = mesh.extract_surface().triangulate().clean()
         pts = np.asarray(surf.points, dtype=float)
         if surf.n_cells == 0 or len(pts) < 3:
             raise ValueError("PolyData slip surface has no triangles.")
@@ -526,9 +535,8 @@ class MeshSlipSurface(SlipSurface3D):
             zb = np.asarray(self._interp(xa.ravel(), ya.ravel()), dtype=float).reshape(xa.shape)
             dz_dx, dz_dy = super().gradients(xa, ya)
             return graph_hits_from_z(zb, dz_dx, dz_dy, max_hits=max_hits)
-        return vertical_mesh_hits(
-            xa, ya, self.vertices, self.faces, z_ray=self._z_ray, max_hits=max_hits
-        )
+        assert self._index is not None
+        return self._index.hits(xa, ya, max_hits=max_hits)
 
     def intersect_segment(
         self,
@@ -599,6 +607,7 @@ class MeshSlipSurface(SlipSurface3D):
         }
         if self.faces is not None:
             payload["faces"] = self.faces.tolist()
+            payload["auto_orient"] = bool(self.auto_orient)
         return payload
 
 
@@ -607,6 +616,11 @@ class ImplicitSlipSurface(SlipSurface3D):
     """General F(x, y, z) = 0 slip manifold sampled by vertical line search.
 
     ``F < 0`` is treated as the interior / sliding-mass side, so ``n = -∇F / |∇F|``.
+
+    Scripting-only: ``fn`` and ``grad_fn`` are Python callables, so ``to_dict`` records
+    only the name and bounds and ``surface_from_dict`` refuses to rebuild the surface. A
+    project using one cannot be reopened from its ``.slp3d.json``; export the surface as
+    a triangle mesh (``MeshSlipSurface``) when it has to be saved.
     """
 
     fn: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]
@@ -865,6 +879,7 @@ def surface_from_dict(d: dict[str, Any]) -> SlipSurface3D:
         return MeshSlipSurface(
             vertices=np.asarray(d["vertices"], dtype=float),
             faces=None if faces is None else np.asarray(faces, dtype=np.int64),
+            auto_orient=bool(d.get("auto_orient", True)),
         )
     if kind == "implicit":
         raise ValueError("ImplicitSlipSurface cannot be deserialized from JSON (callable F).")

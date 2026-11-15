@@ -9,7 +9,8 @@
 - **7 Rigorous & Simplified 3D Method of Columns Solvers (`slipsurface3d/lem/`)**:
   - **3D Ordinary / Fellenius** (Hovland 1977; Hungr 1987)
   - **3D Simplified Bishop** (Hungr 1987; Hungr et al. 1989)
-  - **3D Simplified & Corrected Janbu** (Hungr et al. 1989)
+  - **3D Simplified Janbu** (Hungr et al. 1989)
+  - **3D Corrected Janbu** ($f_0 \cdot F_{\text{Janbu}}$)
   - **3D Rigorous Spencer** (Lam & Fredlund 1993) — coupled global horizontal/vertical force + moment equilibrium
   - **3D General Limit Equilibrium / Morgenstern-Price (`gle_mp`)** — strip-wise intercolumn functions (`constant`, `half-sine`, `clipped-sine`, `trapezoidal`)
   - **3D Cheng & Yip (2007) Asymmetric Equilibrium (`cheng_yip`)** — solves $\sum F_s = 0$, $\sum F_t = 0$, and $\sum M = 0$ simultaneously for oblique 3D sliding azimuth $\psi^*$
@@ -22,7 +23,7 @@
   - **3D Steady-State Anisotropic Seepage Laplace Solver** $\nabla \cdot (\mathbf{K}\nabla H) = 0$ with atmospheric seepage-face breakout (`slipsurface3d/seepage.py`)
 - **3D Geometry, Rock Wedges, Bolt Patterns & GIS/CAD Exchange**:
   - Extruded 2D profiles, multi-section lofted cuts, ESRI ASCII DEM grids (`.asc`), XYZ/CSV point clouds, Binary/ASCII `.stl`, Wavefront `.obj`, 3D `.dxf` (`3DFACE`), and 3D borehole RBF interpolation
-  - Multi-valued 3D slip surfaces (closed ellipsoids, overhanging triangle meshes, implicit $F(x,y,z)=0$) sampled by vertical-ray intersection; Method of Columns uses the first floor-like hit (`sample_base`)
+  - Multi-valued 3D slip surfaces (closed ellipsoids, overhanging triangle meshes, implicit $F(x,y,z)=0$, scripting-only and not saved in project files) sampled by vertical-ray intersection; Method of Columns uses the first floor-like hit (`sample_base`). Imported triangle meshes are rewound automatically, so STL/OBJ winding order does not matter
   - **3D Multi-Plane Rock Wedge (`MultiPlaneWedgeSurface`)** matching closed-form Hoek & Bray (1981) 3D wedge mechanics
   - **Automatic 3D Bolt Pattern Generator** (`BoltPatternSpec3D`), 2D↔3D Cross-Section Slicer & $F_{3D}/F_{2D}$ End-Effect Analyzer (`slipsurface3d/cross_section.py`), and ergonomic Python Scripting API (`slipsurface3d/scripting.py`)
 - **Interactive PyVista / VTK Desktop UI & Engineering Reports**:

@@ -340,3 +340,73 @@ def test_import_2d_slp_json_project_with_loads_supports_and_water(tmp_path: Path
     # Extrude as cylinder option
     p3d_cyl = import_2d_project(p2d_file, y_min=0.0, y_max=20.0, extrude_surface_as_cylinder=True)
     assert p3d_cyl.surface_config.user_surface["ry"] >= 1e8
+
+
+def _bowl_mesh(n: int = 9) -> tuple[np.ndarray, np.ndarray]:
+    xs = np.linspace(-5.0, 5.0, n)
+    xx, yy = np.meshgrid(xs, xs, indexing="ij")
+    verts = np.column_stack([xx.ravel(), yy.ravel(), 0.05 * (xx.ravel() ** 2 + yy.ravel() ** 2)])
+    faces = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a, b, c, d = i * n + j, (i + 1) * n + j, (i + 1) * n + j + 1, i * n + j + 1
+            faces += [[a, b, c], [a, c, d]]
+    return verts, np.asarray(faces, dtype=np.int64)
+
+
+def test_mesh_slip_surface_is_independent_of_triangle_winding(tmp_path: Path):
+    from slipsurface3d.exchange import import_stl_slip_surface
+
+    verts, faces = _bowl_mesh()
+    x = np.array([0.3, 1.7, -3.1])
+    y = np.array([0.4, -2.2, 2.9])
+    expected = 0.05 * (x**2 + y**2)
+    mixed = faces.copy()
+    mixed[::3] = mixed[::3][:, ::-1]
+    for variant in (faces, faces[:, ::-1], mixed):
+        samp = MeshSlipSurface(verts, faces=variant).sample_base(x, y, 10.0, -10.0)
+        assert np.all(samp.valid)
+        assert np.all(samp.normal_xyz[:, 2] > 0.0)
+        # Piecewise-linear facets of a convex bowl lie on or above the true paraboloid.
+        assert np.allclose(samp.z, expected, atol=0.05)
+
+    raw = MeshSlipSurface(verts, faces=faces[:, ::-1], auto_orient=False)
+    assert not np.any(raw.sample_base(x, y, 10.0, -10.0).valid)
+
+    import pyvista as pv
+
+    rev = faces[:, ::-1]
+    poly = pv.PolyData(verts, np.hstack([np.full((len(rev), 1), 3), rev]).ravel())
+    stl = tmp_path / "reversed_bowl.stl"
+    poly.save(str(stl))
+    assert np.all(import_stl_slip_surface(stl).sample_base(x, y, 10.0, -10.0).valid)
+
+
+def test_closed_mesh_is_wound_inward_whatever_the_input_winding():
+    import pyvista as pv
+
+    sphere = pv.Sphere(radius=5.0, center=(0.0, 0.0, 0.0), theta_resolution=24, phi_resolution=24)
+    tri = sphere.triangulate()
+    faces = np.asarray(tri.faces, dtype=np.int64).reshape(-1, 4)[:, 1:]
+    for variant in (faces, faces[:, ::-1]):
+        ms = MeshSlipSurface(np.asarray(tri.points, dtype=float), faces=variant)
+        samp = ms.sample_base(0.7, -0.4, 10.0, -10.0)
+        assert int(samp.n_hits) == 2
+        assert float(samp.z) < 0.0 and float(samp.normal_xyz[2]) > 0.0
+
+
+def test_vertical_mesh_index_matches_brute_force_ray_casting():
+    from slipsurface3d.geometry.intersection import VerticalMeshIndex, ray_triangle_hits
+
+    verts, faces = _bowl_mesh(n=21)
+    roof = verts + np.array([0.0, 0.0, 4.0])
+    all_verts = np.vstack([verts, roof])
+    all_faces = np.vstack([faces, faces[:, ::-1] + len(verts)])
+    rng = np.random.default_rng(7)
+    x = rng.uniform(-6.0, 6.0, 400)
+    y = rng.uniform(-6.0, 6.0, 400)
+    z_idx, n_idx = VerticalMeshIndex(all_verts, all_faces).hits(x, y)
+    orig = np.column_stack([x, y, np.full(x.size, 50.0)])
+    xyz, n_bf = ray_triangle_hits(orig, np.array([0.0, 0.0, -1.0]), all_verts, all_faces)
+    assert np.allclose(z_idx, xyz[:, :, 2], equal_nan=True, atol=1e-9)
+    assert np.allclose(n_idx[:, 0], n_bf[:, 0], equal_nan=True, atol=1e-9)
