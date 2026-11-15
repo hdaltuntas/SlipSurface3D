@@ -39,4 +39,4 @@ jobs:
       - run: xvfb-run -a python main.py --check
       - run: xvfb-run -a python main.py --smoke 0.3
       - run: xvfb-run -a python scripts/audit_verification_3d.py
-      - run: xvfb-run -a pytest -v -p no:cacheprovider
+      - run: xvfb-run -a python -m pytest -v -p no:cacheprovider
