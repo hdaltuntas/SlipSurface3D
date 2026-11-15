@@ -13,6 +13,15 @@ Standalone 3D companion to SlipSurfaceIQ-LE. Licensed under GNU AGPL v3 or later
 - 3D slope-wide Safety Map projecting trial slip bowls onto ground topography.
 - Multi-plane rock wedge (`MultiPlaneWedgeSurface`) matching Hoek & Bray (1981) closed-form 3D wedge mechanics.
 
+## Design standards and strength models
+- Partial-factor design (`slipsurface3d.design`): Eurocode 7 DA1-C1, DA1-C2, DA2 and DA3 presets using the recommended values of EN 1997-1 Annex A, plus user-defined factors. Results are reported as over-design factors (ODF). Pore pressures are not factored; check the National Annex before relying on a preset.
+- Tabulated shear/normal strength function (`SN`) and infinite-strength material (`INF`) that rejects any slip surface passing through it.
+- The Hoek-Brown (mb, s, a), Barton-Bandis, Power Curve, Power Law and SHANSEP parameters are now editable in the Materials dialog.
+
+## Multi-modal search and search limits
+- `surface_config.n_local_minima` reports up to 12 distinct critical surfaces (plan footprints overlapping by less than half), ranked by FoS and drawn in the viewport, the text summary and the PDF report. Secondary modes are sampled less densely than the global minimum, so their FoS is an upper bound on the local minimum.
+- `surface_config.search_limits` restricts the sliding mass to a plan box.
+
 ## Groundwater, seismic, reliability
 - 3D steady-state anisotropic seepage Laplace solver $\nabla \cdot (\mathbf{K}\nabla H) = 0$ with atmospheric seepage-face breakout.
 - Critical yield acceleration $k_y$ ($F_s(k_y) = 1.0$) and Newmark permanent displacement (Jibson 2007, Ambraseys & Menu 1988, accelerogram double integration).

@@ -173,3 +173,60 @@ def test_wayland_and_c_locale_env_guard():
     configure_qt_vtk_env(env=env_off, platform_str="linux")
     assert env_off["QT_QPA_PLATFORM"] == "offscreen"
     assert env_off["LC_NUMERIC"] == "C.UTF-8"
+
+
+def test_design_standard_multimodal_and_new_material_pages(qapp, tmp_path: Path):
+    from slipsurface3d.report.pdf import export_pdf_report_3d
+    from slipsurface3d.scripting import create_simple_slope_project
+
+    proj = create_simple_slope_project(methods=("bishop",), width_y=120.0, effort="fast")
+    proj.surface_config.ry_bounds = [6.0, 18.0]
+
+    # Materials: generic pages are editable, the shear/normal table parses, bad input is refused
+    mdlg = Materials3DDialog(proj.materials)
+    assert mdlg.stack.count() == mdlg.model_cb.count()
+    mdlg.model_cb.setCurrentIndex(mdlg.model_cb.findData("BB"))
+    dict(mdlg._generic_spins["BB"])["bb_jrc"].setValue(7.5)
+    mdlg._save_current()
+    assert mdlg.materials[0].model == "BB" and mdlg.materials[0].bb_jrc == 7.5
+    mdlg.model_cb.setCurrentIndex(mdlg.model_cb.findData("SN"))
+    mdlg.sn_edit.setPlainText("0, 5\n200; 120\n")
+    mdlg._save_current()
+    assert mdlg.materials[0].sn_table == [[0.0, 5.0], [200.0, 120.0]]
+    mdlg.sn_edit.setPlainText("not a table")
+    assert mdlg._parse_sn_table() is None
+    mdlg.done(0)
+
+    # Analysis settings: design standard preset, distinct surfaces and plan limits
+    adlg = AnalysisSurfaceDialog(proj)
+    adlg.design_cb.setCurrentIndex(adlg.design_cb.findData("ec7_da1_c2"))
+    assert adlg.design_spins["friction"].value() == 1.25
+    assert not adlg.design_spins["friction"].isEnabled()
+    adlg.design_cb.setCurrentIndex(adlg.design_cb.findData("user"))
+    assert adlg.design_spins["friction"].isEnabled()
+    adlg.design_spins["friction"].setValue(1.3)
+    adlg.n_minima_sp.setValue(3)
+    adlg.limits_chk.setChecked(True)
+    adlg.lim_y0.setValue(10.0)
+    adlg.lim_y1.setValue(110.0)
+    adlg._on_accept()
+    assert proj.design.key == "user" and proj.design.friction == 1.3
+    assert proj.design.cohesion == 1.25  # carried over from the preset that was showing
+    assert proj.surface_config.n_local_minima == 3
+    assert proj.surface_config.search_limits == [proj.x_min, proj.x_max, 10.0, 110.0]
+
+    win = MainWindow3D(proj)
+    win.show()
+    qapp.processEvents()
+    win.compute_analysis(synchronous=True)
+    assert win.results is not None and len(win.results.local_minima) >= 2
+    assert "Critical ODF" in win.fos_banner.text()
+    win.chk_local_minima.setChecked(False)
+    win.chk_local_minima.setChecked(True)
+    shot = tmp_path / "minima.png"
+    win.viewport.export_screenshot(str(shot))
+    assert shot.stat().st_size > 2000
+    pdf = export_pdf_report_3d(tmp_path / "design.pdf", win.project, win.results)
+    assert pdf.stat().st_size > 5000
+    win.viewport.cleanup()
+    win.close()

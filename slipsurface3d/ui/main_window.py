@@ -417,6 +417,13 @@ class MainWindow3D(QMainWindow):
         )
         fvis.addRow("", self.chk_safety_map)
 
+        self.chk_local_minima = QCheckBox("Show Secondary Critical Surfaces")
+        self.chk_local_minima.setChecked(True)
+        self.chk_local_minima.toggled.connect(
+            lambda v: self.viewport.set_layer_visibility(local_minima=v)
+        )
+        fvis.addRow("", self.chk_local_minima)
+
         self.chk_forces = QCheckBox("Show Picked Column 3D Force Arrows")
         self.chk_forces.setChecked(True)
         self.chk_forces.toggled.connect(
@@ -534,7 +541,8 @@ class MainWindow3D(QMainWindow):
         prim = self.results.primary_result
         fos_txt = f"{prim.fos:.4f}" if np.isfinite(prim.fos) else "N/A (Not Converged)"
         self.fos_banner.setText(
-            f"Critical FoS ({METHODS_3D[self.results.primary_method][0]}): {fos_txt}\n"
+            f"Critical {self.results.result_label} "
+            f"({METHODS_3D[self.results.primary_method][0]}): {fos_txt}\n"
             f"Volume: {self.results.columns.total_volume:.1f} m³ | "
             f"Columns: {self.results.columns.n} | Azimuth: {self.results.columns.azimuth_deg:.1f}°"
         )

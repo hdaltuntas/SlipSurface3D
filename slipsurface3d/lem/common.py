@@ -55,8 +55,8 @@ def _evaluate_strength(cols: ColumnGrid, sigma_n: np.ndarray) -> tuple[np.ndarra
             sigma_v=cols.sigma_v_eff[mask] if mat.uses_vertical_stress else None,
             normal_xyz=cols.normal_xyz[mask] if mat.uses_normal_vector else None,
         )
-        c_arr[mask] = c_sub
-        tp_arr[mask] = tp_sub
+        c_arr[mask] = c_sub / mat.pf_c
+        tp_arr[mask] = tp_sub / mat.pf_tanphi
     return c_arr, tp_arr
 
 
@@ -67,9 +67,17 @@ def _has_nonlinear_material(cols: ColumnGrid) -> bool:
         HoekBrownDirect3D,
         PowerCurve3D,
         PowerLaw3D,
+        ShearNormalFunction3D,
     )
 
-    nl_types = (HoekBrown3D, HoekBrownDirect3D, BartonBandis3D, PowerCurve3D, PowerLaw3D)
+    nl_types = (
+        HoekBrown3D,
+        HoekBrownDirect3D,
+        BartonBandis3D,
+        PowerCurve3D,
+        PowerLaw3D,
+        ShearNormalFunction3D,
+    )
     present = set(np.unique(cols.mat_idx).tolist())
     return any(isinstance(cols.materials[i], nl_types) for i in present)
 

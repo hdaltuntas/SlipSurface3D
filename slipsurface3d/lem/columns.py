@@ -634,6 +634,12 @@ def discretize_columns(
     # Basal material index (just inside the column above z_base)
     mat_idx = model.material_indices_at(x, y, zb + np.minimum(1e-4, 0.02 * h), mat_names)
 
+    infinite = np.array([m.infinite_strength for m in materials], dtype=bool)
+    if np.any(infinite[mat_idx]):
+        raise ColumnDiscretizationError(
+            "Slip surface passes through an infinite-strength material."
+        )
+
     z_wt = model.water_z(x, y)
     gamma_dry = np.array([m.gamma for m in materials], dtype=float)
     gamma_sat = np.array([m.gamma_sat for m in materials], dtype=float)

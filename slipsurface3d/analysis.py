@@ -13,6 +13,7 @@ from slipsurface3d.geometry.terrain import SlopeModel3D
 from slipsurface3d.lem.columns import ColumnGrid, discretize_columns
 from slipsurface3d.lem.solvers import METHODS_3D, LEMResult3D, solve_surface_3d
 from slipsurface3d.optimizer.search import (
+    LocalMinimum3D,
     SafetyMap3D,
     compute_safety_map_3d,
     search_critical_surface_3d,
@@ -30,6 +31,9 @@ class AnalysisResults3D:
     governing_kv: float = 0.0
     trials: list[tuple[SlipSurface3D, float]] = field(default_factory=list)
     safety_map: SafetyMap3D | None = None
+    local_minima: list[LocalMinimum3D] = field(default_factory=list)
+    result_label: str = "FoS"
+    design_summary: str = ""
     evaluations: int = 0
     elapsed_s: float = 0.0
     cancelled: bool = False
@@ -67,6 +71,7 @@ def _run_for_kv(
         assert surf is not None
         cols = discretize_columns(model, surf, materials, opts=col_opts, material_colors=colors)
         trials: list[tuple[SlipSurface3D, float]] = []
+        local_minima: list[LocalMinimum3D] = []
         evals = 1
     else:
         s_cfg = project.build_search_settings()
@@ -86,6 +91,7 @@ def _run_for_kv(
         surf = sr.critical_surface
         cols = sr.critical_columns
         trials = sr.trials
+        local_minima = sr.local_minima
         evals = sr.evaluations
         cancelled = sr.cancelled
 
@@ -119,6 +125,9 @@ def _run_for_kv(
         governing_kv=kv_val,
         trials=trials,
         safety_map=s_map,
+        local_minima=local_minima,
+        result_label=project.design.result_label,
+        design_summary=project.design.summary() if project.design.active else "",
         evaluations=evals,
         elapsed_s=elapsed,
         cancelled=cancelled,
@@ -179,8 +188,15 @@ def report_text_3d(project: Project3D, res: AnalysisResults3D) -> str:
         f"Sliding Azimuth: {cols.azimuth_deg:.1f} deg | Seismic: kh={cols.kh:g}, kv={res.governing_kv:g}",
         f"Reinforcement Intersections: {len(cols.support_hits)} | "
         f"Evaluations: {res.evaluations} ({res.elapsed_s:.2f} s)",
+    ]
+    if res.design_summary:
+        lines.append(f"Design Standard: {res.design_summary}")
+        lines.append(
+            "Reported values are over-design factors (ODF >= 1.0 satisfies the limit state)."
+        )
+    lines += [
         "-" * 72,
-        f"{'Method':<26} {'FoS':>9} {'Conv':>6} {'Adm':>6} {'lambda':>9} {'m_a,min':>9}",
+        f"{'Method':<26} {res.result_label:>9} {'Conv':>6} {'Adm':>6} {'lambda':>9} {'m_a,min':>9}",
         "-" * 72,
     ]
     for key, r in res.method_results.items():
@@ -195,5 +211,16 @@ def report_text_3d(project: Project3D, res: AnalysisResults3D) -> str:
             lines.append(f"  * Admissibility note: {r.issue}")
         if r.message:
             lines.append(f"  * Solver message: {r.message}")
+    if len(res.local_minima) > 1:
+        lines.append("-" * 72)
+        lines.append(f"Distinct critical surfaces ({METHODS_3D[res.primary_method][0]}):")
+        lines.append(
+            f"{'#':>3} {res.result_label:>9} {'Volume [m^3]':>14} {'Azimuth':>9}   Centroid (x, y) [m]"
+        )
+        for i, lm in enumerate(res.local_minima, 1):
+            lines.append(
+                f"{i:>3} {lm.fos:>9.4f} {lm.volume:>14.1f} {lm.azimuth_deg:>8.1f}°   "
+                f"({lm.centroid_xy[0]:.2f}, {lm.centroid_xy[1]:.2f})"
+            )
     lines.append("=" * 72)
     return "\n".join(lines)

@@ -177,7 +177,15 @@ def export_pdf_report_3d(
     # 1. 3D Factor of Safety Summary Table
     story.append(Paragraph("1. Three-Dimensional Limit Equilibrium Results", h2_style))
     fos_rows = [
-        ["3D LEM Method", "FoS", "Converged", "Admissible", "lambda", "m_alpha,min", "|Res| max"]
+        [
+            "3D LEM Method",
+            results.result_label,
+            "Converged",
+            "Admissible",
+            "lambda",
+            "m_alpha,min",
+            "|Res| max",
+        ]
     ]
     for key, res in results.method_results.items():
         label = METHODS_3D[key][0]
@@ -222,6 +230,22 @@ def export_pdf_report_3d(
     )
     story.append(t_fos)
     story.append(Spacer(1, 3 * mm))
+    if results.design_summary:
+        story.append(
+            Paragraph(
+                f"<b>Design standard:</b> {results.design_summary}. Reported values are "
+                "over-design factors; ODF &ge; 1.0 satisfies the limit state.",
+                body_style,
+            )
+        )
+    if len(results.local_minima) > 1:
+        modes = "; ".join(
+            f"#{i} {results.result_label} {lm.fos:.3f} "
+            f"(V = {lm.volume:.0f} m<sup>3</sup>, centroid {lm.centroid_xy[0]:.1f}, "
+            f"{lm.centroid_xy[1]:.1f} m)"
+            for i, lm in enumerate(results.local_minima, 1)
+        )
+        story.append(Paragraph(f"<b>Distinct critical surfaces:</b> {modes}", body_style))
 
     cols = results.columns
     story.append(

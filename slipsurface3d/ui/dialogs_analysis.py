@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -26,6 +27,13 @@ from PySide6.QtWidgets import (
 )
 
 from slipsurface3d.analysis import AnalysisResults3D
+from slipsurface3d.design import (
+    DESIGN_PRESETS,
+    USER_DESIGN_KEY,
+    USER_DESIGN_LABEL,
+    DesignFactors3D,
+    design_preset,
+)
 from slipsurface3d.geometry.surfaces import (
     EllipsoidSurface,
     MultiPlaneWedgeSurface,
@@ -169,11 +177,33 @@ class AnalysisSurfaceDialog(QDialog):
         self.w_dip2 = _dspin(1.0, 88.0, float(p2_d.get("dip_deg", 45.0)), 1, 2.0, "deg")
         self.w_dd2 = _dspin(0.0, 360.0, float(p2_d.get("dip_dir_deg", 130.0)), 1, 5.0, "deg")
 
+        self.n_minima_sp = QSpinBox()
+        self.n_minima_sp.setRange(1, 12)
+        self.n_minima_sp.setValue(sc.n_local_minima)
+        self.n_minima_sp.setToolTip(
+            "Multi-modal search: report this many distinct failure modes (plan footprints "
+            "overlapping by less than half). 1 = global minimum only."
+        )
+        lim = sc.search_limits or [project.x_min, project.x_max, project.y_min, project.y_max]
+        self.limits_chk = QCheckBox("Restrict sliding mass to plan limits")
+        self.limits_chk.setChecked(sc.search_limits is not None)
+        self.lim_x0 = _dspin(-1e6, 1e6, float(lim[0]), 2, 1.0, "m")
+        self.lim_x1 = _dspin(-1e6, 1e6, float(lim[1]), 2, 1.0, "m")
+        self.lim_y0 = _dspin(-1e6, 1e6, float(lim[2]), 2, 1.0, "m")
+        self.lim_y1 = _dspin(-1e6, 1e6, float(lim[3]), 2, 1.0, "m")
+        for w_lim in (self.lim_x0, self.lim_x1, self.lim_y0, self.lim_y1):
+            w_lim.setEnabled(self.limits_chk.isChecked())
+            self.limits_chk.toggled.connect(w_lim.setEnabled)
+
         fsf.addRow("Surface Mode:", self.mode_cb)
         fsf.addRow("Surface / Search Geometry:", self.kind_cb)
         fsf.addRow("Search Effort:", self.effort_cb)
         fsf.addRow("", self.opt_az_chk)
         fsf.addRow("", self.sao_chk)
+        fsf.addRow("Distinct Critical Surfaces:", self.n_minima_sp)
+        fsf.addRow("", self.limits_chk)
+        fsf.addRow("Limits X min / max:", self._row2(self.lim_x0, self.lim_x1))
+        fsf.addRow("Limits Y min / max:", self._row2(self.lim_y0, self.lim_y1))
         fsf.addRow(QLabel("<b>User Ellipsoid (Mode=user, Geometry=ellipsoid/sphere):</b>"))
         fsf.addRow("Centre Xc / Yc / Zc:", self._row3(self.uxc, self.uyc, self.uzc))
         fsf.addRow("Semi-Axes Rx / Ry / Rz:", self._row3(self.urx, self.ury, self.urz))
@@ -182,6 +212,40 @@ class AnalysisSurfaceDialog(QDialog):
         fsf.addRow("Joint B Dip / Dip-Dir:", self._row2(self.w_dip2, self.w_dd2))
         tabs.addTab(w_sf, "3D Slip Surface")
 
+        # Tab 4: Design standard (partial factors)
+        w_ds = QWidget()
+        fds = QFormLayout(w_ds)
+        ds = project.design
+        self.design_cb = QComboBox()
+        for key, preset in DESIGN_PRESETS.items():
+            self.design_cb.addItem(preset.label, key)
+        self.design_cb.addItem(USER_DESIGN_LABEL, USER_DESIGN_KEY)
+        self.design_cb.setCurrentIndex(max(0, self.design_cb.findData(ds.key)))
+        self.design_spins: dict[str, QDoubleSpinBox] = {}
+        fds.addRow("Design Standard:", self.design_cb)
+        for attr, label in (
+            ("permanent_action", "Permanent actions γG (soil unit weight):"),
+            ("variable_action", "Variable actions γQ (patch / point loads):"),
+            ("cohesion", "Effective cohesion γc':"),
+            ("friction", "Friction γφ' (on tan φ'):"),
+            ("undrained", "Undrained strength γcu:"),
+            ("support_resistance", "Support resistance γa:"),
+            ("earth_resistance", "Earth resistance γR;e:"),
+        ):
+            sp = _dspin(0.1, 10.0, float(getattr(ds, attr)), 3, 0.05)
+            self.design_spins[attr] = sp
+            fds.addRow(label, sp)
+        ds_hint = QLabel(
+            "With a design standard active, results are over-design factors (ODF ≥ 1.0 "
+            "satisfies the limit state). Eurocode 7 presets use the recommended values of "
+            "EN 1997-1 Annex A — check your National Annex. Pore pressures are not factored."
+        )
+        ds_hint.setWordWrap(True)
+        fds.addRow(ds_hint)
+        self.design_cb.currentIndexChanged.connect(self._on_design_changed)
+        self._on_design_changed(load_preset=False)
+        tabs.addTab(w_ds, "Design Standard")
+
         layout.addWidget(tabs, 1)
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -189,6 +253,16 @@ class AnalysisSurfaceDialog(QDialog):
         btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+
+    def _on_design_changed(self, _idx: int = 0, load_preset: bool = True) -> None:
+        key = str(self.design_cb.currentData())
+        is_user = key == USER_DESIGN_KEY
+        if load_preset and not is_user:
+            preset = design_preset(key)
+            for attr, sp in self.design_spins.items():
+                sp.setValue(float(getattr(preset, attr)))
+        for sp in self.design_spins.values():
+            sp.setEnabled(is_user)
 
     def _refresh_primary_methods(self) -> None:
         selected = [k for k, chk in self.meth_checks.items() if chk.isChecked()]
@@ -225,6 +299,18 @@ class AnalysisSurfaceDialog(QDialog):
         if not selected:
             QMessageBox.warning(self, "Analysis Settings", "Select at least one 3D LEM method.")
             return
+        if self.limits_chk.isChecked() and (
+            self.lim_x1.value() <= self.lim_x0.value() or self.lim_y1.value() <= self.lim_y0.value()
+        ):
+            QMessageBox.warning(self, "Analysis Settings", "Search limits need max > min.")
+            return
+        d_key = str(self.design_cb.currentData())
+        base = design_preset(d_key)
+        self._project.design = DesignFactors3D(
+            key=base.key,
+            label=base.label,
+            **{attr: sp.value() for attr, sp in self.design_spins.items()},
+        )
         an = self._project.analysis
         an.methods = selected
         an.nx = self.nx_sp.value()
@@ -254,6 +340,17 @@ class AnalysisSurfaceDialog(QDialog):
         sc.primary_method = str(self.primary_cb.currentData() or selected[0])
         sc.optimize_azimuth = self.opt_az_chk.isChecked()
         sc.sao_enabled = self.sao_chk.isChecked()
+        sc.n_local_minima = self.n_minima_sp.value()
+        sc.search_limits = (
+            [
+                self.lim_x0.value(),
+                self.lim_x1.value(),
+                self.lim_y0.value(),
+                self.lim_y1.value(),
+            ]
+            if self.limits_chk.isChecked()
+            else None
+        )
         if sc.mode == "user":
             if sc.surface_kind == "wedge":
                 p = self._project

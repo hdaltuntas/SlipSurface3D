@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QStackedWidget,
     QTableWidget,
@@ -178,6 +180,45 @@ class Import2DExtrusionDialog(QDialog):
         self.accept()
 
 
+# Editable parameters of the constitutive models that share a generic form page:
+# (MaterialSpec3D attribute, label, min, max, decimals, step, unit suffix)
+_GENERIC_MODEL_FIELDS: dict[str, list[tuple[str, str, float, float, int, float, str]]] = {
+    "HBD": [
+        ("sigma_ci", "Intact UCS σ_ci:", 10.0, 500_000.0, 1, 1000.0, "kPa"),
+        ("hb_mb", "mb:", 0.001, 50.0, 4, 0.1, ""),
+        ("hb_s", "s:", 0.0, 1.0, 6, 0.001, ""),
+        ("hb_a", "a:", 0.5, 0.67, 4, 0.005, ""),
+    ],
+    "BB": [
+        ("bb_phir", "Residual Friction φr:", 0.0, 85.0, 2, 1.0, "deg"),
+        ("bb_jrc", "Joint Roughness JRC:", 0.0, 20.0, 2, 1.0, ""),
+        ("bb_jcs", "Joint Wall Strength JCS:", 1.0, 1_000_000.0, 1, 1000.0, "kPa"),
+        ("bb_l0", "Lab Joint Length L0:", 0.001, 100.0, 3, 0.05, "m"),
+        ("bb_ln", "Field Joint Length Ln:", 0.001, 1000.0, 3, 0.5, "m"),
+    ],
+    "PC": [
+        ("pc_a", "Coefficient a:", 0.0001, 1000.0, 4, 0.1, ""),
+        ("pc_b", "Exponent b:", 0.01, 1.0, 4, 0.05, ""),
+        ("pc_c", "Cohesive Intercept c:", 0.0, 100_000.0, 2, 1.0, "kPa"),
+        ("pc_d", "Tensile Shift d:", 0.0, 100_000.0, 2, 1.0, "kPa"),
+    ],
+    "PL": [
+        ("coefficient", "Coefficient:", 0.0001, 1000.0, 4, 0.05, ""),
+        ("exponent", "Exponent:", 0.01, 1.0, 4, 0.05, ""),
+        ("reference_pressure", "Reference Pressure:", 0.01, 100_000.0, 2, 10.0, "kPa"),
+    ],
+    "SH": [
+        ("shansep_s", "Normally Consolidated Ratio S:", 0.01, 2.0, 3, 0.01, ""),
+        ("shansep_m", "OCR Exponent m:", 0.0, 2.0, 3, 0.05, ""),
+        ("ocr", "OCR at Top:", 1.0, 100.0, 2, 0.5, ""),
+        ("ocr_bottom", "OCR at Bottom:", 1.0, 100.0, 2, 0.5, ""),
+        ("z_top", "Top Elevation z_top:", -500.0, 1000.0, 2, 1.0, "m"),
+        ("z_bottom", "Bottom Elevation z_bot:", -500.0, 1000.0, 2, 1.0, "m"),
+        ("shansep_su_min", "Minimum su:", 0.0, 10_000.0, 2, 1.0, "kPa"),
+    ],
+}
+
+
 class Materials3DDialog(QDialog):
     """Create, edit, recolor, and configure 3D constitutive material models."""
 
@@ -279,10 +320,16 @@ class Materials3DDialog(QDialog):
         self.stack.addWidget(w_hb)
 
         # 4..8: HBD, BB, PC, PL, SH compact generic pages + 9: ANISO3D
+        self._generic_spins: dict[str, list[tuple[str, QDoubleSpinBox]]] = {}
         for code in ("HBD", "BB", "PC", "PL", "SH"):
             w_gen = QGroupBox(f"{MODEL_LABELS[code]} Parameters")
             fl = QFormLayout(w_gen)
-            fl.addRow(QLabel("Configured parameters preserved in project JSON."))
+            spins: list[tuple[str, QDoubleSpinBox]] = []
+            for attr, label, lo, hi, dec, step, unit in _GENERIC_MODEL_FIELDS[code]:
+                sp = _dspin(lo, hi, lo, dec, step, unit)
+                fl.addRow(label, sp)
+                spins.append((attr, sp))
+            self._generic_spins[code] = spins
             self.stack.addWidget(w_gen)
 
         w_an = QGroupBox("3D Anisotropic Bedding (Dip / Dip-Direction)")
@@ -300,6 +347,36 @@ class Materials3DDialog(QDialog):
         f_an.addRow("Bedding Dip:", self.dip_sp)
         f_an.addRow("Bedding Dip-Direction:", self.dipdir_sp)
         self.stack.addWidget(w_an)
+
+        # Shear / Normal function (tabulated envelope)
+        w_sn = QGroupBox("Shear / Normal Function")
+        f_sn = QVBoxLayout(w_sn)
+        f_sn.addWidget(
+            QLabel(
+                "One point per line: σn, τ  [kPa]. Piecewise linear; the last segment's "
+                "slope continues beyond the final point."
+            )
+        )
+        self.sn_edit = QPlainTextEdit()
+        self.sn_edit.setPlaceholderText("0, 0\n100, 60\n300, 150")
+        f_sn.addWidget(self.sn_edit, 1)
+        self.stack.addWidget(w_sn)
+
+        # Infinite strength
+        w_inf = QGroupBox("Infinite Strength")
+        f_inf = QVBoxLayout(w_inf)
+        inf_lbl = QLabel(
+            "No slip surface may pass through this material (bedrock, mass concrete). "
+            "Trial surfaces whose base enters it are rejected; its weight still loads "
+            "the columns above a slip surface."
+        )
+        inf_lbl.setWordWrap(True)
+        f_inf.addWidget(inf_lbl)
+        f_inf.addStretch(1)
+        self.stack.addWidget(w_inf)
+
+        if self.stack.count() != len(self._model_codes):
+            raise RuntimeError("Material dialog pages are out of sync with MODEL_LABELS.")
 
         right.addWidget(self.stack)
 
@@ -350,6 +427,29 @@ class Materials3DDialog(QDialog):
         m.phi_bedding = self.phibed_sp.value()
         m.dip_deg = self.dip_sp.value()
         m.dip_dir_deg = self.dipdir_sp.value()
+        # Generic pages share some attributes with the fixed pages (sigma_ci, z_top...),
+        # so only the page of the selected model is written back.
+        for attr, sp in self._generic_spins.get(m.model, []):
+            setattr(m, attr, sp.value())
+        table = self._parse_sn_table()
+        if table is not None:
+            m.sn_table = table
+
+    def _parse_sn_table(self) -> list[list[float]] | None:
+        """Parse the shear/normal editor; ``None`` when the text is not a valid table."""
+        rows: list[list[float]] = []
+        for line in self.sn_edit.toPlainText().splitlines():
+            parts = line.replace(";", ",").replace("\t", ",").split(",")
+            parts = [p.strip() for p in parts if p.strip()]
+            if not parts:
+                continue
+            if len(parts) != 2:
+                return None
+            try:
+                rows.append([float(parts[0]), float(parts[1])])
+            except ValueError:
+                return None
+        return rows if len(rows) >= 2 else None
 
     def _load_current(self) -> None:
         if not (0 <= self._idx < len(self.materials)):
@@ -385,6 +485,10 @@ class Materials3DDialog(QDialog):
         self.phibed_sp.setValue(m.phi_bedding)
         self.dip_sp.setValue(m.dip_deg)
         self.dipdir_sp.setValue(m.dip_dir_deg)
+        for spins in self._generic_spins.values():
+            for attr, sp in spins:
+                sp.setValue(float(getattr(m, attr)))
+        self.sn_edit.setPlainText("\n".join(f"{a:g}, {b:g}" for a, b in m.sn_table))
         self._updating = False
 
     def _on_row_changed(self, row: int) -> None:
@@ -431,6 +535,23 @@ class Materials3DDialog(QDialog):
         if len(set(names)) != len(names):
             QMessageBox.warning(self, "Materials", "Material names must be unique.")
             return
+        if (
+            0 <= self._idx < len(self.materials)
+            and self.materials[self._idx].model == "SN"
+            and self._parse_sn_table() is None
+        ):
+            QMessageBox.warning(
+                self,
+                "Materials",
+                "The shear / normal function needs at least two lines of the form 'σn, τ'.",
+            )
+            return
+        for m in self.materials:
+            try:
+                m.to_material()
+            except ValueError as exc:
+                QMessageBox.warning(self, "Materials", str(exc))
+                return
         self.accept()
 
 

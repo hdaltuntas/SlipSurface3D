@@ -13,6 +13,11 @@ from typing import Any
 
 import numpy as np
 
+from slipsurface3d.design import (
+    DesignFactors3D,
+    apply_design_to_loads,
+    apply_design_to_materials,
+)
 from slipsurface3d.geometry.surfaces import (
     SlipSurface3D,
     surface_from_dict,
@@ -135,6 +140,10 @@ class MaterialSpec3D:
     dip_deg: float = 20.0
     dip_dir_deg: float = 180.0
     transition_deg: float = 20.0
+    # Shear / Normal function: [[sigma_n, tau], ...] in kPa
+    sn_table: list[list[float]] = field(
+        default_factory=lambda: [[0.0, 0.0], [100.0, 60.0], [300.0, 150.0]]
+    )
 
     def to_material(self) -> Material3D:
         return material_from_spec_dict(asdict(self))
@@ -189,6 +198,10 @@ class SurfaceConfig3D:
     user_surface: dict[str, Any] | None = None
     y_center_range: list[float] | None = None
     ry_bounds: list[float] | None = None
+    # Number of distinct critical surfaces reported by the search (1 = global minimum only)
+    n_local_minima: int = 1
+    # Plan search limits [x_min, x_max, y_min, y_max] the sliding mass must stay inside
+    search_limits: list[float] | None = None
 
 
 @dataclass
@@ -215,6 +228,7 @@ class Project3D:
     seepage_bc: SeepageBC3D | None = None
     analysis: AnalysisSettings3D = field(default_factory=AnalysisSettings3D)
     surface_config: SurfaceConfig3D = field(default_factory=SurfaceConfig3D)
+    design: DesignFactors3D = field(default_factory=DesignFactors3D)
 
     def copy(self) -> Project3D:
         return copy.deepcopy(self)
@@ -292,6 +306,16 @@ class Project3D:
             raise ValueError(f"Unknown search effort: {sc.effort!r}.")
         if sc.primary_method not in METHODS_3D:
             raise ValueError(f"Unknown primary search method: {sc.primary_method!r}.")
+        if not 1 <= sc.n_local_minima <= 12:
+            raise ValueError("surface_config.n_local_minima must be between 1 and 12.")
+        if sc.search_limits is not None:
+            if len(sc.search_limits) != 4:
+                raise ValueError("search_limits requires [x_min, x_max, y_min, y_max].")
+            lx0, lx1, ly0, ly1 = (float(v) for v in sc.search_limits)
+            if lx1 <= lx0 or ly1 <= ly0:
+                raise ValueError("search_limits require x_max > x_min and y_max > y_min.")
+            if lx1 <= self.x_min or lx0 >= self.x_max or ly1 <= self.y_min or ly0 >= self.y_max:
+                raise ValueError("search_limits lie outside the model domain.")
         if sc.mode == "user":
             if sc.user_surface is None:
                 raise ValueError("surface_config.mode='user' requires user_surface definition.")
@@ -324,7 +348,7 @@ class Project3D:
         )
 
     def build_materials(self) -> list[Material3D]:
-        return [m.to_material() for m in self.materials]
+        return apply_design_to_materials([m.to_material() for m in self.materials], self.design)
 
     def build_loads(self) -> LoadSet3D:
         st_map = {st.name: st for st in self.support_types}
@@ -343,12 +367,13 @@ class Project3D:
                     label=str(b.get("label", f"Bolt {i}")),
                 )
             )
-        return LoadSet3D(
+        loads = LoadSet3D(
             patch_loads=list(self.patch_loads),
             point_loads=list(self.point_loads),
             bolts=bolt_objs,
             tension_crack=self.tension_crack,
         )
+        return apply_design_to_loads(loads, self.design)
 
     def build_column_options(self, kv_override: float | None = None) -> ColumnOptions:
         a = self.analysis
@@ -390,6 +415,17 @@ class Project3D:
             check_admissibility=self.analysis.check_admissibility,
             m_alpha_min=self.analysis.m_alpha_min,
             seed=sc.seed,
+            n_local_minima=int(sc.n_local_minima),
+            search_limits=(
+                (
+                    float(sc.search_limits[0]),
+                    float(sc.search_limits[1]),
+                    float(sc.search_limits[2]),
+                    float(sc.search_limits[3]),
+                )
+                if sc.search_limits and len(sc.search_limits) == 4
+                else None
+            ),
             y_center_range=(
                 (float(sc.y_center_range[0]), float(sc.y_center_range[1]))
                 if sc.y_center_range and len(sc.y_center_range) == 2
@@ -433,6 +469,7 @@ class Project3D:
             "seepage_bc": None if self.seepage_bc is None else self.seepage_bc.to_dict(),
             "analysis": asdict(self.analysis),
             "surface_config": asdict(self.surface_config),
+            "design": self.design.to_dict(),
         }
 
     @classmethod
@@ -502,6 +539,7 @@ class Project3D:
             seepage_bc=seep_bc,
             analysis=AnalysisSettings3D(**an_raw),
             surface_config=SurfaceConfig3D(**sc_raw),
+            design=DesignFactors3D.from_dict(d.get("design")),
         )
         proj.validate()
         return proj

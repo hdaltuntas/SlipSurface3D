@@ -8,7 +8,7 @@ at column base effective normal stress ``sigma_n >= 0`` so that shear strength i
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -24,6 +24,8 @@ MODEL_LABELS: dict[str, str] = {
     "PL": "Power Law",
     "SH": "SHANSEP",
     "ANISO3D": "3D Anisotropic Bedding (Dip / Dip-Direction)",
+    "SN": "Shear / Normal Function (tabulated)",
+    "INF": "Infinite Strength (excluded from sliding)",
 }
 
 
@@ -43,6 +45,11 @@ class Material3D(ABC):
     uses_vertical_stress: bool = False
     uses_normal_vector: bool = False
     total_stress: bool = False
+    # Slip surfaces may not pass through an infinite-strength material (bedrock, concrete).
+    infinite_strength: bool = False
+    # Design-standard partial factors dividing the cohesive and frictional strength terms.
+    pf_c: float = 1.0
+    pf_tanphi: float = 1.0
 
     def __post_init__(self) -> None:
         if self.gamma <= 0 or self.gamma_sat <= 0:
@@ -437,6 +444,80 @@ class AnisotropicBedding3D(Material3D):
         return c_eq.reshape(sn.shape), tp_eq.reshape(sn.shape)
 
 
+@dataclass
+class ShearNormalFunction3D(Material3D):
+    """Tabulated shear strength envelope tau(sigma_n), piecewise linear between points.
+
+    ``table`` holds ``(sigma_n, tau)`` pairs in kPa. Below the first point the first value
+    is held; beyond the last point the envelope continues at the slope of the last segment.
+    """
+
+    table: list[tuple[float, float]] = field(
+        default_factory=lambda: [(0.0, 0.0), (100.0, 60.0), (300.0, 150.0)]
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        pts = np.asarray(self.table, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 2 or not np.all(np.isfinite(pts)):
+            raise ValueError(
+                f"{self.name}: shear/normal function needs >= 2 (sigma_n, tau) points."
+            )
+        pts = pts[np.argsort(pts[:, 0], kind="stable")]
+        if np.any(np.diff(pts[:, 0]) <= 0.0):
+            raise ValueError(f"{self.name}: shear/normal function sigma_n values must be distinct.")
+        if pts[0, 0] < 0.0 or np.any(pts[:, 1] < 0.0) or np.any(np.diff(pts[:, 1]) < 0.0):
+            raise ValueError(
+                f"{self.name}: shear/normal function requires sigma_n >= 0 and non-decreasing tau >= 0."
+            )
+        self.table = [(float(a), float(b)) for a, b in pts]
+        self._sn = pts[:, 0]
+        self._tau = pts[:, 1]
+        self._slope = np.diff(pts[:, 1]) / np.diff(pts[:, 0])
+
+    def strength(
+        self,
+        sigma_n: np.ndarray,
+        *,
+        z: np.ndarray | None = None,
+        sigma_v: np.ndarray | None = None,
+        normal_xyz: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sn = np.maximum(np.asarray(sigma_n, dtype=float), 0.0)
+        seg = np.clip(np.searchsorted(self._sn, sn, side="right") - 1, 0, len(self._slope) - 1)
+        tp = np.where(sn < self._sn[0], 0.0, self._slope[seg])
+        tau = np.where(
+            sn < self._sn[0], self._tau[0], self._tau[seg] + (sn - self._sn[seg]) * self._slope[seg]
+        )
+        c_eq = np.maximum(tau - sn * tp, 0.0)
+        return c_eq, tp
+
+
+@dataclass
+class InfiniteStrength3D(Material3D):
+    """Material no slip surface may pass through (bedrock, mass concrete, retaining structures).
+
+    It still contributes weight to the columns above a slip surface. A trial surface whose
+    base lies inside it is rejected during column discretisation.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.infinite_strength = True
+        self.total_stress = True
+
+    def strength(
+        self,
+        sigma_n: np.ndarray,
+        *,
+        z: np.ndarray | None = None,
+        sigma_v: np.ndarray | None = None,
+        normal_xyz: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sn = np.asarray(sigma_n, dtype=float)
+        return np.full_like(sn, 1.0e9), np.zeros_like(sn)
+
+
 def material_from_spec_dict(d: dict[str, Any]) -> Material3D:
     """Instantiate a Material3D from a serialized MaterialSpec3D or 2D MaterialSpec dictionary."""
     name = str(d.get("name", "Soil 1"))
@@ -529,6 +610,13 @@ def material_from_spec_dict(d: dict[str, Any]) -> Material3D:
             transition_deg=float(d.get("transition_deg", 20.0)),
             **common,
         )
+    if model == "SN":
+        raw_table = d.get("sn_table") or [(0.0, 0.0), (100.0, 60.0), (300.0, 150.0)]
+        return ShearNormalFunction3D(
+            table=[(float(row[0]), float(row[1])) for row in raw_table], **common
+        )
+    if model == "INF":
+        return InfiniteStrength3D(**common)
     if model == "CN":
         # CNI nonlinear rock mass mapped to PowerCurve3D
         sc = float(d.get("cni_sigma_c", 10_000.0))

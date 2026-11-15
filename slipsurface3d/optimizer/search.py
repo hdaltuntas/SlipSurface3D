@@ -58,9 +58,23 @@ class SearchSettings3D:
     check_admissibility: bool = True
     m_alpha_min: float = M_ALPHA_MIN_DEFAULT
     seed: int = 42
-    x_entry_range: tuple[float, float] | None = None
+    # Plan box (x_min, x_max, y_min, y_max) every sliding column must lie inside.
+    search_limits: tuple[float, float, float, float] | None = None
+    # Number of distinct critical surfaces to report (1 = global minimum only).
+    n_local_minima: int = 1
     y_center_range: tuple[float, float] | None = None
     ry_bounds: tuple[float, float] | None = None
+
+
+@dataclass
+class LocalMinimum3D:
+    """One of several distinct critical surfaces found by the multi-modal search."""
+
+    surface: SlipSurface3D
+    fos: float
+    volume: float
+    azimuth_deg: float
+    centroid_xy: tuple[float, float]
 
 
 @dataclass
@@ -69,6 +83,7 @@ class SearchResult3D:
     critical_columns: ColumnGrid
     critical_result: LEMResult3D
     trials: list[tuple[SlipSurface3D, float]] = field(default_factory=list)
+    local_minima: list[LocalMinimum3D] = field(default_factory=list)
     evaluations: int = 0
     cancelled: bool = False
 
@@ -102,6 +117,17 @@ def _parameter_bounds(
         yc_hi = model.y_max - 0.20 * span_y
         if yc_hi <= yc_lo:
             yc_lo = yc_hi = 0.5 * (model.y_min + model.y_max)
+    if settings.search_limits is not None:
+        # The slip mass lies below the centre, so the centre must sit inside the limits.
+        lx0, lx1, ly0, ly1 = settings.search_limits
+        xc_lo, xc_hi = max(xc_lo, lx0), min(xc_hi, lx1)
+        if settings.y_center_range is None:
+            yc_lo, yc_hi = max(yc_lo, ly0), min(yc_hi, ly1)
+            if yc_hi < yc_lo:
+                # Limits lie in the edge band the default range avoids: use their centre.
+                yc_lo = yc_hi = float(np.clip(0.5 * (ly0 + ly1), model.y_min, model.y_max))
+        if xc_hi <= xc_lo:
+            raise ValueError("Search limits leave no room for a slip surface inside the model.")
 
     zc_lo = z_low + 0.4 * h_slope
     zc_hi = z_high + 2.8 * h_slope
@@ -146,6 +172,180 @@ def _decode_surface(
         rz=float(vec[5]),
         azimuth_deg=az,
     )
+
+
+def _within_limits(cols: ColumnGrid, limits: tuple[float, float, float, float] | None) -> bool:
+    """True when every active column centre lies inside the plan search limits."""
+    if limits is None:
+        return True
+    x0, x1, y0, y1 = limits
+    return bool(
+        float(np.min(cols.x)) >= x0
+        and float(np.max(cols.x)) <= x1
+        and float(np.min(cols.y)) >= y0
+        and float(np.max(cols.y)) <= y1
+    )
+
+
+def _plan_footprint(
+    surface: SlipSurface3D, xx: np.ndarray, yy: np.ndarray, zg: np.ndarray, z_min: float
+) -> np.ndarray:
+    """Boolean plan mask of where the slip surface lies below ground."""
+    zb = surface.sample_base(xx, yy, zg, z_min).z
+    return np.isfinite(zb) & ((zg - zb) > 1e-3)
+
+
+def _footprint_overlap(a: np.ndarray, b: np.ndarray) -> float:
+    """Overlap of two plan masks as a fraction of the smaller one (1 = one inside the other)."""
+    smaller = min(int(np.count_nonzero(a)), int(np.count_nonzero(b)))
+    if smaller == 0:
+        return 0.0
+    return float(np.count_nonzero(a & b)) / smaller
+
+
+def _encode_ellipsoid(surface: EllipsoidSurface, base_kind: str, optimize_az: bool) -> np.ndarray:
+    if base_kind == "sphere":
+        return np.array([surface.xc, surface.yc, surface.zc, surface.rx], dtype=float)
+    vec = [surface.xc, surface.yc, surface.zc, surface.rx, surface.ry, surface.rz]
+    if optimize_az:
+        vec.append(surface.azimuth_deg)
+    return np.array(vec, dtype=float)
+
+
+def _polish_mode(
+    vec0: np.ndarray,
+    seed_mask: np.ndarray,
+    kept_masks: list[np.ndarray],
+    footprint: Callable[[SlipSurface3D], np.ndarray],
+    evaluate: Callable[[np.ndarray], tuple[SlipSurface3D | None, float]],
+    bounds: tuple[np.ndarray, np.ndarray],
+    nm_maxfev: int,
+    max_overlap: float,
+    cancel_check: Callable[[], bool] | None,
+) -> tuple[SlipSurface3D | None, float, int]:
+    """Short Nelder-Mead refinement of one failure mode, confined to its own footprint."""
+    lo, hi = bounds
+    span = np.maximum(hi - lo, 1e-6)
+    best_surface: SlipSurface3D | None = None
+    best_fos = PENALTY_FOS
+    evals = 0
+
+    def objective(u_norm: np.ndarray) -> float:
+        nonlocal best_surface, best_fos, evals
+        if cancel_check is not None and cancel_check():
+            return PENALTY_FOS
+        if np.any(u_norm < 0.0) or np.any(u_norm > 1.0):
+            return PENALTY_FOS
+        evals += 1
+        cand, fos = evaluate(lo + u_norm * span)
+        if cand is None or fos >= PENALTY_FOS:
+            return PENALTY_FOS
+        # Stay in this mode: mostly inside the seed footprint, clear of the kept ones.
+        cand_mask = footprint(cand)
+        if _footprint_overlap(cand_mask, seed_mask) < 0.6:
+            return PENALTY_FOS
+        if any(_footprint_overlap(cand_mask, other) >= max_overlap for other in kept_masks):
+            return PENALTY_FOS
+        if fos < best_fos:
+            best_fos = fos
+            best_surface = cand
+        return fos
+
+    minimize(
+        objective,
+        np.clip((vec0 - lo) / span, 0.0, 1.0),
+        method="Nelder-Mead",
+        options={"maxfev": nm_maxfev, "xatol": 2e-3, "fatol": 1e-3},
+    )
+    return best_surface, best_fos, evals
+
+
+def _find_local_minima(
+    *,
+    fast_model: SlopeModel3D,
+    trials: list[tuple[SlipSurface3D, float]],
+    critical: tuple[SlipSurface3D, ColumnGrid, float],
+    n_wanted: int,
+    evaluate: Callable[[np.ndarray], tuple[SlipSurface3D | None, float]],
+    finalize: Callable[[SlipSurface3D], tuple[ColumnGrid, float] | None],
+    bounds: tuple[np.ndarray, np.ndarray],
+    optimize_azimuth: bool,
+    base_kind: str,
+    nm_maxfev: int,
+    cancel_check: Callable[[], bool] | None,
+    max_overlap: float = 0.5,
+    max_candidates: int = 600,
+) -> tuple[list[LocalMinimum3D], int]:
+    """Pick distinct low-FoS failure modes from the search history and polish each one.
+
+    Trial surfaces are visited from lowest FoS upward. One is a new mode when its plan
+    footprint overlaps every mode already kept by less than ``max_overlap`` of the smaller
+    footprint. Each new mode is then refined by a short Nelder-Mead run that is confined to
+    its own footprint so it cannot slide back into the global minimum. The refinement runs
+    on the coarse screening grid; the reported FoS is a final full-resolution solution.
+
+    The global search concentrates its samples around the global minimum, so secondary
+    modes are explored less densely: their FoS is an upper bound on the local minimum.
+    """
+    xs = np.linspace(fast_model.x_min, fast_model.x_max, 56)
+    ys = np.linspace(fast_model.y_min, fast_model.y_max, 56)
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    zg = fast_model.ground_z(xx, yy)
+
+    def footprint(surface: SlipSurface3D) -> np.ndarray:
+        return _plan_footprint(surface, xx, yy, zg, fast_model.z_min)
+
+    def describe(surface: SlipSurface3D, cols: ColumnGrid, fos: float) -> LocalMinimum3D:
+        weights = cols.h * cols.dA
+        total = float(np.sum(weights))
+        return LocalMinimum3D(
+            surface=surface,
+            fos=fos,
+            volume=cols.total_volume,
+            azimuth_deg=cols.azimuth_deg,
+            centroid_xy=(
+                float(np.sum(weights * cols.x) / total),
+                float(np.sum(weights * cols.y) / total),
+            ),
+        )
+
+    crit_surface, crit_cols, crit_fos = critical
+    kept_masks = [footprint(crit_surface)]
+    minima = [describe(crit_surface, crit_cols, crit_fos)]
+    evals = 0
+
+    ellipsoids = [(s, f) for s, f in trials if isinstance(s, EllipsoidSurface) and np.isfinite(f)]
+    ellipsoids.sort(key=lambda item: item[1])
+    for surf, _screen_fos in ellipsoids[:max_candidates]:
+        if len(minima) >= n_wanted or (cancel_check is not None and cancel_check()):
+            break
+        mask = footprint(surf)
+        if not np.any(mask):
+            continue
+        if any(_footprint_overlap(mask, other) >= max_overlap for other in kept_masks):
+            continue
+        polished, _fos, n_ev = _polish_mode(
+            _encode_ellipsoid(surf, base_kind, optimize_azimuth),
+            mask,
+            kept_masks,
+            footprint,
+            evaluate,
+            bounds,
+            nm_maxfev,
+            max_overlap,
+            cancel_check,
+        )
+        evals += n_ev
+        if polished is None:
+            continue
+        final = finalize(polished)
+        evals += 1
+        if final is None:
+            continue
+        kept_masks.append(footprint(polished))
+        minima.append(describe(polished, final[0], final[1]))
+
+    return minima, evals
 
 
 def _levy_step(rng: np.random.Generator, dim: int, beta: float = 1.5) -> np.ndarray:
@@ -355,6 +555,8 @@ def search_critical_surface_3d(
         if not res.ok:
             return None, PENALTY_FOS
         if settings.check_admissibility and not res.admissible:
+            return None, PENALTY_FOS
+        if not _within_limits(cols, settings.search_limits):
             return None, PENALTY_FOS
         return surf, float(res.fos)
 
@@ -579,11 +781,63 @@ def search_critical_surface_3d(
         m_alpha_min=settings.m_alpha_min,
         interslice=settings.gle_interslice,
     )
+    local_minima: list[LocalMinimum3D] = []
+    still_running = not (cancelled or bool(cancel_check is not None and cancel_check()))
+    if settings.n_local_minima > 1 and still_running and crit_res.ok:
+
+        def _finalize(surf: SlipSurface3D) -> tuple[ColumnGrid, float] | None:
+            try:
+                f_cols = discretize_columns(
+                    model, surf, materials, opts=col_opts, material_colors=material_colors
+                )
+            except ColumnDiscretizationError:
+                return None
+            f_res = solve_surface_3d(
+                f_cols,
+                method=settings.primary_method,
+                tolerance=solver_tolerance,
+                max_iter=solver_max_iter,
+                m_alpha_min=settings.m_alpha_min,
+                interslice=settings.gle_interslice,
+            )
+            return (f_cols, float(f_res.fos)) if f_res.ok else None
+
+        local_minima, extra_evals = _find_local_minima(
+            fast_model=fast_model,
+            trials=list(trials),
+            critical=(crit_surface, crit_cols, float(crit_res.fos)),
+            n_wanted=int(settings.n_local_minima),
+            evaluate=lambda v: _eval_pure(v, fine=False),
+            finalize=_finalize,
+            bounds=(lo, hi),
+            optimize_azimuth=settings.optimize_azimuth,
+            base_kind=base_kind,
+            nm_maxfev=max(90, 3 * nm_fev),
+            cancel_check=cancel_check,
+        )
+        eval_count += extra_evals
+        # A refined secondary mode can undercut the main search: promote it to critical.
+        local_minima.sort(key=lambda m: m.fos)
+        if local_minima[0].surface is not crit_surface:
+            promoted = _finalize(local_minima[0].surface)
+            if promoted is not None:
+                crit_surface = local_minima[0].surface
+                crit_cols = promoted[0]
+                crit_res = solve_surface_3d(
+                    crit_cols,
+                    method=settings.primary_method,
+                    tolerance=solver_tolerance,
+                    max_iter=solver_max_iter,
+                    m_alpha_min=settings.m_alpha_min,
+                    interslice=settings.gle_interslice,
+                )
+
     return SearchResult3D(
         critical_surface=crit_surface,
         critical_columns=crit_cols,
         critical_result=crit_res,
         trials=trials,
+        local_minima=local_minima,
         evaluations=eval_count,
         cancelled=cancelled or bool(cancel_check is not None and cancel_check()),
     )

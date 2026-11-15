@@ -52,6 +52,7 @@ files = [
     "slipsurface3d/project_import.py",
     "slipsurface3d/project_examples.py",
     "slipsurface3d/analysis.py",
+    "slipsurface3d/design.py",
     "slipsurface3d/exchange.py",
     "slipsurface3d/probabilistic.py",
     "slipsurface3d/seismic.py",

@@ -36,6 +36,9 @@ SCALAR_FIELD_OPTIONS: list[tuple[str, str]] = [
 ]
 
 
+LOCAL_MINIMA_COLORS: list[str] = ["#f59e0b", "#a855f7", "#06b6d4", "#84cc16", "#ec4899"]
+
+
 class _EmbeddedQtPlotter(pv.BasePlotter):
     """Lightweight PyVista BasePlotter bound directly to a QVTKRenderWindowInteractor."""
 
@@ -84,6 +87,7 @@ class Viewport3D(QWidget):
         self._show_loads_supports: bool = True
         self._clip_mid_y: bool = False
         self._show_safety_map: bool = False
+        self._show_local_minima: bool = True
         self._show_force_vectors: bool = True
         self._live_trial_surface: SlipSurface3D | None = None
         self._selected_col: int = -1
@@ -151,6 +155,7 @@ class Viewport3D(QWidget):
         loads_supports: bool | None = None,
         clip_mid_y: bool | None = None,
         safety_map: bool | None = None,
+        local_minima: bool | None = None,
         force_vectors: bool | None = None,
     ) -> None:
         if columns is not None:
@@ -165,6 +170,8 @@ class Viewport3D(QWidget):
             self._clip_mid_y = clip_mid_y
         if safety_map is not None:
             self._show_safety_map = safety_map
+        if local_minima is not None:
+            self._show_local_minima = local_minima
         if force_vectors is not None:
             self._show_force_vectors = force_vectors
         self.rebuild_scene(reset_camera=False)
@@ -380,6 +387,37 @@ class Viewport3D(QWidget):
                 )
                 if slip_mesh.n_points > 0:
                     pl.add_mesh(slip_mesh, color="#ef4444", opacity=0.60, smooth_shading=True)
+
+            # Secondary failure modes from the multi-modal search (index 0 is the critical one)
+            if self._show_local_minima and len(res.local_minima) > 1:
+                label_pts: list[list[float]] = []
+                label_txt: list[str] = []
+                for rank, lm in enumerate(res.local_minima[1:], start=2):
+                    lm_mesh = lm.surface.to_mesh(
+                        model.x_bounds, model.y_bounds, ground_fn=model.ground_z, nx=44, ny=44
+                    )
+                    if lm_mesh.n_points == 0:
+                        continue
+                    pl.add_mesh(
+                        lm_mesh,
+                        color=LOCAL_MINIMA_COLORS[(rank - 2) % len(LOCAL_MINIMA_COLORS)],
+                        opacity=0.45,
+                        smooth_shading=True,
+                        pickable=False,
+                    )
+                    cx, cy = lm.centroid_xy
+                    label_pts.append([cx, cy, float(model.ground_z(cx, cy)) + 0.5])
+                    label_txt.append(f"#{rank}  {res.result_label} {lm.fos:.3f}")
+                if label_pts:
+                    pl.add_point_labels(
+                        np.asarray(label_pts, dtype=float),
+                        label_txt,
+                        font_size=12,
+                        text_color=fg_col,
+                        shape_opacity=0.35,
+                        show_points=False,
+                        always_visible=True,
+                    )
 
         pl.show_bounds(
             grid="back",
