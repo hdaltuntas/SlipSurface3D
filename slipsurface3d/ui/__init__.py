@@ -33,6 +33,8 @@ def configure_qt_vtk_env(
       ``vtkXOpenGLRenderWindow: The result is out of range, failed to get the converted tmp``).
       Automatically selects ``QT_QPA_PLATFORM=xcb`` via XWayland when ``DISPLAY`` is present,
       or ``offscreen`` when running on pure headless Wayland without XWayland.
+    * On Windows, force ``QT_QPA_PLATFORM=offscreen`` to avoid native VTK/Qt crashes
+      (exit code 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN) with QVTKRenderWindowInteractor.
     """
     target = os.environ if env is None else env
     plat = sys.platform if platform_str is None else platform_str
@@ -53,6 +55,10 @@ def configure_qt_vtk_env(
         )
         if is_wayland:
             target["QT_QPA_PLATFORM"] = "xcb" if target.get("DISPLAY") else "offscreen"
+
+    # Force offscreen rendering on Windows to prevent VTK/Qt native crash (0xC0000409)
+    if plat.startswith("win") and not target.get("QT_QPA_PLATFORM"):
+        target["QT_QPA_PLATFORM"] = "offscreen"
 
 
 configure_qt_vtk_env()
