@@ -120,7 +120,8 @@ def _run_for_kv(
 
     warnings: list[str] = []
     if an.pore_mode == "grid" and project.pore_grid:
-        inside = PorePressureGrid3D(project.pore_grid).coverage(cols.x, cols.y, cols.z_base)
+        grid = PorePressureGrid3D(project.pore_grid, gamma_w=an.gamma_w)
+        inside = grid.coverage(cols.x, cols.y, cols.z_base)
         if inside < 0.999:
             warnings.append(
                 f"{100.0 * (1.0 - inside):.0f}% of the column bases lie outside the "

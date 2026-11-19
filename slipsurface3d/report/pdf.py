@@ -60,6 +60,36 @@ def render_offscreen_scene_png(
     if wt_mesh is not None:
         plotter.add_mesh(wt_mesh, color="#2563eb", opacity=0.30, smooth_shading=True)
 
+    # Weak layers (buried portion)
+    for wl in model.weak_layers:
+        wl_grid = wl.horizon.to_mesh(model.x_bounds, model.y_bounds, nx=36, ny=28)
+        pts = np.asarray(wl_grid.points)
+        buried = pts[:, 2] <= np.asarray(model.ground_z(pts[:, 0], pts[:, 1])) + 1e-6
+        wl_grid["Buried"] = buried.astype(float)
+        wl_mesh = wl_grid.threshold(0.5, scalars="Buried", preference="point")
+        if wl_mesh.n_cells > 0:
+            plotter.add_mesh(
+                wl_mesh,
+                color=mat_colors.get(wl.material, "#f43f5e"),
+                opacity=0.50,
+                show_edges=True,
+                edge_color="#475569",
+                line_width=0.4,
+            )
+
+    # Geotextile sheets & pile rows
+    for sheet in project.geotextiles:
+        panel = pv.PolyData(sheet.corners(), faces=np.array([4, 0, 1, 2, 3]))
+        plotter.add_mesh(panel, color="#0ea5e9", opacity=0.45, show_edges=True)
+    for row in project.pile_rows:
+        for px, py in row.pile_positions():
+            z_head = float(model.ground_z(float(px), float(py)))
+            plotter.add_mesh(
+                pv.Line((px, py, z_head), (px, py, z_head - row.length_m)),
+                color="#64748b",
+                line_width=3.5,
+            )
+
     # Bolts
     for b in project.bolts:
         head = np.asarray(b["head"], dtype=float)
@@ -90,6 +120,18 @@ def render_offscreen_scene_png(
         )
         if slip_poly.n_points > 0:
             plotter.add_mesh(slip_poly, color="#dc2626", opacity=0.55, smooth_shading=True)
+        secondary_colors = ("#f59e0b", "#0891b2", "#7c3aed", "#059669")
+        for idx_m, mode in enumerate(results.local_minima[1:]):
+            m_poly = mode.surface.to_mesh(
+                model.x_bounds, model.y_bounds, ground_fn=model.ground_z, nx=44, ny=44
+            )
+            if m_poly.n_points > 0:
+                plotter.add_mesh(
+                    m_poly,
+                    color=secondary_colors[idx_m % len(secondary_colors)],
+                    opacity=0.35,
+                    smooth_shading=True,
+                )
 
     plotter.show_bounds(
         grid="back",

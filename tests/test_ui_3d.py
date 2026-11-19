@@ -312,13 +312,13 @@ def test_supports_stages_dialogs_and_stage_display(qapp, tmp_path: Path):
         dlg.stage_table.item(1, col).setText(text)
     from slipsurface3d.loads.supports import GeotextileSheet3D
 
-    dlg.geo_table.item(0, 6).setText("not a number")
+    dlg.geo_table.item(0, 9).setText("not a number")
     try:
         dlg.geo_table.records(GeotextileSheet3D, GeotextileSheet3D())
         raise AssertionError("a non-numeric cell must be rejected")
     except ValueError as exc:
         assert "Row 1" in str(exc) and "Tensile" in str(exc)
-    dlg.geo_table.item(0, 6).setText("75,5")  # decimal comma is accepted
+    dlg.geo_table.item(0, 9).setText("75,5")  # decimal comma is accepted
     dlg._on_accept()
     dlg.apply_to_project(proj)
     assert proj.geotextiles[0].tensile_kn_m == 75.5

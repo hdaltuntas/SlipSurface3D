@@ -230,8 +230,13 @@ class Stage3D:
     level: float = 0.0
     batter: float = 1.5
     fill_material: str = ""
+    # Flat water-table elevation from this stage on (None = unchanged from the stage before)
+    water_level: float | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.water_level, str):
+            text = self.water_level.strip().replace(",", ".")
+            self.water_level = float(text) if text else None
         if self.kind not in ("excavation", "fill"):
             raise ValueError(f"{self.name}: stage kind must be 'excavation' or 'fill'.")
         if self.x2 < self.x1:
@@ -290,6 +295,10 @@ class Project3D:
     geotextiles: list[GeotextileSheet3D] = field(default_factory=list)
     pile_rows: list[PileRow3D] = field(default_factory=list)
     stages: list[Stage3D] = field(default_factory=list)
+    # Set on the per-stage copies made by ``stages.stage_project``; a saved project is
+    # always at stage 0 (initial ground), so these are not written to the project file.
+    active_stage: int = 0
+    stage_fills: list[tuple[str, HorizonSurface]] = field(default_factory=list)
 
     def copy(self) -> Project3D:
         return copy.deepcopy(self)
@@ -350,16 +359,12 @@ class Project3D:
         if a.pore_mode == "grid":
             if not self.pore_grid:
                 raise ValueError("pore_mode='grid' requires imported pore-pressure samples.")
-            PorePressureGrid3D(self.pore_grid)
+            PorePressureGrid3D(self.pore_grid, gamma_w=a.gamma_w)
         for stage in self.stages:
             if stage.kind == "fill":
                 if stage.fill_material and stage.fill_material not in names:
                     raise ValueError(
                         f"Stage '{stage.name}': fill material {stage.fill_material!r} is not defined."
-                    )
-                if self.profile_regions:
-                    raise ValueError(
-                        f"Stage '{stage.name}': fills need a layered model, not extruded 2D regions."
                     )
         for wl in self.weak_layers:
             if wl.material not in names:
@@ -435,17 +440,20 @@ class Project3D:
             name=self.summary.title,
             weak_layers=list(self.weak_layers),
             piezo_surfaces=dict(self.piezo_surfaces),
+            fill_layers=list(self.stage_fills),
         )
 
     def build_materials(self) -> list[Material3D]:
         return apply_design_to_materials([m.to_material() for m in self.materials], self.design)
 
     def build_loads(self) -> LoadSet3D:
+        # Loads and supports act from their ``from_stage`` onward; a plain analysis is stage 0.
+        stage = self.active_stage
         st_map = {st.name: st for st in self.support_types}
         bolt_objs: list[Bolt3D] = []
         for i, b in enumerate(self.bolts, 1):
             st = st_map.get(b["type"])
-            if st is None:
+            if st is None or int(b.get("from_stage", 0)) > stage:
                 continue
             h = tuple(float(v) for v in b["head"])
             t = tuple(float(v) for v in b["tip"])
@@ -462,12 +470,14 @@ class Project3D:
                 self.rebuild_from_boreholes()
             assert self.ground is not None
             for sheet in self.geotextiles:
-                bolt_objs.extend(sheet.to_bolts(self.ground.z))
+                if sheet.from_stage <= stage:
+                    bolt_objs.extend(sheet.to_bolts(self.ground.z))
             for row in self.pile_rows:
-                bolt_objs.extend(row.to_bolts(self.ground.z))
+                if row.from_stage <= stage:
+                    bolt_objs.extend(row.to_bolts(self.ground.z))
         loads = LoadSet3D(
-            patch_loads=list(self.patch_loads),
-            point_loads=list(self.point_loads),
+            patch_loads=[pl for pl in self.patch_loads if pl.from_stage <= stage],
+            point_loads=[pt for pt in self.point_loads if pt.from_stage <= stage],
             bolts=bolt_objs,
             tension_crack=self.tension_crack,
         )
@@ -480,7 +490,7 @@ class Project3D:
         if pore == "water_table" and self.water_table is None and not self.piezo_surfaces:
             pore = "none"
         elif pore == "grid":
-            pore_fn = PorePressureGrid3D(self.pore_grid)
+            pore_fn = PorePressureGrid3D(self.pore_grid, gamma_w=a.gamma_w)
         elif pore == "seepage":
             seep_grid = solve_seepage_3d(self.build_model(), bc=self.seepage_bc, gamma_w=a.gamma_w)
             pore_fn = seep_grid.pore_pressure_at

@@ -10,6 +10,7 @@ import numpy as np
 from scipy.stats import norm
 
 from slipsurface3d.analysis import run_analysis_3d
+from slipsurface3d.design import apply_design_to_materials
 from slipsurface3d.geometry.surfaces import SlipSurface3D
 from slipsurface3d.lem.columns import discretize_columns
 from slipsurface3d.lem.solvers import solve_surface_3d
@@ -285,7 +286,7 @@ def run_probabilistic_3d(
             m_specs, kh_i, kv_i, ru_i = _apply_sample_to_specs(
                 project.materials, an.kh, an.kv, an.ru, var_specs, sample_cols, i
             )
-            mats_i = [ms.to_material() for ms in m_specs]
+            mats_i = apply_design_to_materials([ms.to_material() for ms in m_specs], project.design)
             if re_discretize:
                 opts_i = copy.copy(base_opts)
                 opts_i.kh = kh_i

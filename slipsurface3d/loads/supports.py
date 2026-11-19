@@ -36,6 +36,7 @@ class PatchLoad3D:
     azimuth_deg: float = 0.0
     plunge_deg: float = 90.0  # 90 deg = vertical downward (+Z is up, so force is -Z)
     name: str = "Patch Load"
+    from_stage: int = 0  # construction stage from which the load acts
 
     def __post_init__(self) -> None:
         if self.x2 < self.x1:
@@ -76,6 +77,7 @@ class PatchLoad3D:
             "azimuth_deg": float(self.azimuth_deg),
             "plunge_deg": float(self.plunge_deg),
             "name": self.name,
+            "from_stage": int(self.from_stage),
         }
 
     @classmethod
@@ -90,6 +92,7 @@ class PatchLoad3D:
             azimuth_deg=float(d.get("azimuth_deg", 0.0)),
             plunge_deg=float(d.get("plunge_deg", 90.0)),
             name=str(d.get("name", "Patch Load")),
+            from_stage=int(d.get("from_stage", 0)),
         )
 
 
@@ -104,6 +107,7 @@ class PointLoad3D:
     azimuth_deg: float = 180.0
     plunge_deg: float = 90.0  # 90 deg = vertical downward
     name: str = "Point Load"
+    from_stage: int = 0  # construction stage from which the load acts
 
     def force_xyz(self) -> np.ndarray:
         pl = float(np.radians(self.plunge_deg))
@@ -122,6 +126,7 @@ class PointLoad3D:
             "azimuth_deg": float(self.azimuth_deg),
             "plunge_deg": float(self.plunge_deg),
             "name": self.name,
+            "from_stage": int(self.from_stage),
         }
 
     @classmethod
@@ -134,6 +139,7 @@ class PointLoad3D:
             azimuth_deg=float(d.get("azimuth_deg", 180.0)),
             plunge_deg=float(d.get("plunge_deg", 90.0)),
             name=str(d.get("name", "Point Load")),
+            from_stage=int(d.get("from_stage", 0)),
         )
 
 
@@ -366,17 +372,20 @@ def generate_bolt_pattern_3d(
 
 @dataclass
 class GeotextileSheet3D:
-    """Horizontal sheet of planar reinforcement (geotextile / geogrid) at elevation ``z``.
+    """Planar sheet of reinforcement (geotextile / geogrid), horizontal or inclined.
 
-    The sheet covers the plan box ``[x1, x2] x [y1, y2]`` and carries tension along
-    ``direction`` ("x" or "y"). It is analysed as parallel strips ``strip_spacing`` wide, so
-    each strip is cut by the slip surface where it actually crosses and takes
+    The sheet covers the plan box ``[x1, x2] x [y1, y2]``. ``z`` is its elevation at the box
+    centre; ``dip_deg`` / ``dip_dir_deg`` tilt it (dip direction in the XY plane, 0 = +X,
+    90 = +Y). Tension acts along ``azimuth_deg`` in plan (0 = along X, 90 = along Y), within
+    the sheet's plane. The sheet is analysed as parallel strips ``strip_spacing`` wide, so
+    each strip is cut where the slip surface actually crosses it and takes
 
         T = min(tensile, pullout * L_anchored, anchorage + pullout * L_in_sliding_mass)
 
     per metre width, where ``tensile_kn_m`` is the long-term design strength [kN/m],
-    ``pullout_kpa`` the pullout resistance per unit plan area of sheet (both faces together)
-    and ``anchorage_kn_m`` the capacity of the connection at the slope face (0 = free end).
+    ``pullout_kpa`` the pullout resistance per unit area of sheet (both faces together) and
+    ``anchorage_kn_m`` the capacity of the connection at the slope face (0 = free end).
+    ``from_stage`` is the construction stage from which the sheet is installed.
     """
 
     name: str = "Geotextile 1"
@@ -388,17 +397,19 @@ class GeotextileSheet3D:
     tensile_kn_m: float = 50.0
     pullout_kpa: float = 20.0
     anchorage_kn_m: float = 0.0
-    direction: str = "x"
+    azimuth_deg: float = 0.0
+    dip_deg: float = 0.0
+    dip_dir_deg: float = 180.0
     strip_spacing: float = 1.0
     application: str = "passive"
+    from_stage: int = 0
 
     def __post_init__(self) -> None:
         if self.x2 < self.x1:
             self.x1, self.x2 = self.x2, self.x1
         if self.y2 < self.y1:
             self.y1, self.y2 = self.y2, self.y1
-        if self.direction not in ("x", "y"):
-            raise ValueError(f"{self.name}: direction must be 'x' or 'y'.")
+        self.from_stage = int(self.from_stage)
         if self.application not in ("active", "passive"):
             raise ValueError(f"{self.name}: application must be 'active' or 'passive'.")
         if self.x2 - self.x1 <= 1e-9 or self.y2 - self.y1 <= 1e-9:
@@ -407,49 +418,99 @@ class GeotextileSheet3D:
             raise ValueError(f"{self.name}: spacing must be > 0 and strengths >= 0.")
         if self.anchorage_kn_m < 0:
             raise ValueError(f"{self.name}: anchorage capacity must be >= 0.")
+        if not 0.0 <= self.dip_deg < 80.0:
+            raise ValueError(f"{self.name}: dip must be within [0, 80) degrees.")
+        if self.from_stage < 0:
+            raise ValueError(f"{self.name}: from_stage must be >= 0.")
 
     def to_dict(self) -> dict[str, Any]:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GeotextileSheet3D:
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        data = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        if "azimuth_deg" not in data and d.get("direction") == "y":
+            data["azimuth_deg"] = 90.0  # files written before arbitrary directions existed
+        return cls(**data)
+
+    def z_at(self, x: Any, y: Any) -> np.ndarray:
+        """Elevation of the sheet's plane at plan position (x, y)."""
+        xa, ya = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+        dd = np.radians(self.dip_dir_deg)
+        xc, yc = 0.5 * (self.x1 + self.x2), 0.5 * (self.y1 + self.y2)
+        drop = np.tan(np.radians(self.dip_deg)) * ((xa - xc) * np.cos(dd) + (ya - yc) * np.sin(dd))
+        return self.z - drop
+
+    def corners(self) -> np.ndarray:
+        """The four 3D corners of the sheet, in order around its outline."""
+        xy = np.array(
+            [[self.x1, self.y1], [self.x2, self.y1], [self.x2, self.y2], [self.x1, self.y2]]
+        )
+        return np.column_stack([xy, self.z_at(xy[:, 0], xy[:, 1])])
+
+    def strip_segments(self) -> list[tuple[np.ndarray, np.ndarray, float]]:
+        """Centre lines of the strips as ``(end_a, end_b, strip_width)`` in 3D."""
+        az = np.radians(self.azimuth_deg)
+        d = np.array([np.cos(az), np.sin(az)])
+        n = np.array([-d[1], d[0]])
+        centre = np.array([0.5 * (self.x1 + self.x2), 0.5 * (self.y1 + self.y2)])
+        box = self.corners()[:, :2]
+        offs = (box - centre) @ n
+        lo, hi = float(offs.min()), float(offs.max())
+        n_strips = max(1, int(round((hi - lo) / self.strip_spacing)))
+        width = (hi - lo) / n_strips
+        out: list[tuple[np.ndarray, np.ndarray, float]] = []
+        for i in range(n_strips):
+            origin = centre + (lo + (i + 0.5) * width) * n
+            # Clip the strip's centre line to the plan box (slab method)
+            t0, t1 = -np.inf, np.inf
+            for axis, (b_lo, b_hi) in enumerate(((self.x1, self.x2), (self.y1, self.y2))):
+                if abs(d[axis]) < 1e-12:
+                    if not b_lo - 1e-9 <= origin[axis] <= b_hi + 1e-9:
+                        t0, t1 = 1.0, 0.0
+                    continue
+                ta = (b_lo - origin[axis]) / d[axis]
+                tb = (b_hi - origin[axis]) / d[axis]
+                t0, t1 = max(t0, min(ta, tb)), min(t1, max(ta, tb))
+            if t1 - t0 <= 1e-6:
+                continue
+            pa, pb = origin + t0 * d, origin + t1 * d
+            out.append(
+                (
+                    np.array([pa[0], pa[1], float(self.z_at(pa[0], pa[1]))]),
+                    np.array([pb[0], pb[1], float(self.z_at(pb[0], pb[1]))]),
+                    width,
+                )
+            )
+        return out
 
     def to_bolts(self, ground_z_fn: Callable[[Any, Any], np.ndarray]) -> list[Bolt3D]:
         """Expand into strip elements; each strip's head is its end nearest the slope face."""
-        along_x = self.direction == "x"
-        width = (self.y2 - self.y1) if along_x else (self.x2 - self.x1)
-        n_strips = max(1, int(round(width / self.strip_spacing)))
-        w_strip = width / n_strips
-        strip_type = SupportType3D(
-            name=f"{self.name} strip",
-            kind="geotextile",
-            tensile_kn=self.tensile_kn_m * w_strip,
-            plate_kn=self.anchorage_kn_m * w_strip,
-            bond_strength_kn_m=self.pullout_kpa * w_strip,
-            bond_length_m=0.0,
-            application=self.application,
-            color="#0ea5e9",
-        )
+        types: dict[float, SupportType3D] = {}
         bolts: list[Bolt3D] = []
-        for i in range(n_strips):
-            offset = (i + 0.5) * w_strip
-            if along_x:
-                a = (self.x1, self.y1 + offset, self.z)
-                b = (self.x2, self.y1 + offset, self.z)
-            else:
-                a = (self.x1 + offset, self.y1, self.z)
-                b = (self.x1 + offset, self.y2, self.z)
+        for i, (a, b, width) in enumerate(self.strip_segments(), 1):
+            key = round(width, 9)
+            if key not in types:
+                types[key] = SupportType3D(
+                    name=f"{self.name} strip",
+                    kind="geotextile",
+                    tensile_kn=self.tensile_kn_m * width,
+                    plate_kn=self.anchorage_kn_m * width,
+                    bond_strength_kn_m=self.pullout_kpa * width,
+                    bond_length_m=0.0,
+                    application=self.application,
+                    color="#0ea5e9",
+                )
             # The face end is the one with less soil cover above the sheet.
-            cover_a = float(np.asarray(ground_z_fn(a[0], a[1])).ravel()[0]) - self.z
-            cover_b = float(np.asarray(ground_z_fn(b[0], b[1])).ravel()[0]) - self.z
+            cover_a = float(np.asarray(ground_z_fn(a[0], a[1])).ravel()[0]) - a[2]
+            cover_b = float(np.asarray(ground_z_fn(b[0], b[1])).ravel()[0]) - b[2]
             head, tip = (a, b) if cover_a <= cover_b else (b, a)
             bolts.append(
                 Bolt3D(
-                    head_xyz=head,
-                    tip_xyz=tip,
-                    support_type=strip_type,
-                    label=f"{self.name} strip {i + 1}",
+                    head_xyz=(float(head[0]), float(head[1]), float(head[2])),
+                    tip_xyz=(float(tip[0]), float(tip[1]), float(tip[2])),
+                    support_type=types[key],
+                    label=f"{self.name} strip {i}",
                 )
             )
         return bolts
@@ -473,8 +534,12 @@ class PileRow3D:
     length_m: float = 12.0
     shear_kn: float = 150.0
     application: str = "passive"
+    from_stage: int = 0  # construction stage from which the piles are installed
 
     def __post_init__(self) -> None:
+        self.from_stage = int(self.from_stage)
+        if self.from_stage < 0:
+            raise ValueError(f"{self.name}: from_stage must be >= 0.")
         if self.spacing <= 0 or self.length_m <= 0 or self.shear_kn < 0:
             raise ValueError(f"{self.name}: spacing and length must be > 0, shear >= 0.")
         if self.application not in ("active", "passive"):

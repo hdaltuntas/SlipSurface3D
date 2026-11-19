@@ -325,12 +325,7 @@ class Viewport3D(QWidget):
 
             # Geotextile sheets as translucent panels, pile rows as vertical bars
             for sheet in proj.geotextiles:
-                panel = pv.Plane(
-                    center=(0.5 * (sheet.x1 + sheet.x2), 0.5 * (sheet.y1 + sheet.y2), sheet.z),
-                    direction=(0.0, 0.0, 1.0),
-                    i_size=sheet.x2 - sheet.x1,
-                    j_size=sheet.y2 - sheet.y1,
-                )
+                panel = pv.PolyData(sheet.corners(), faces=np.array([4, 0, 1, 2, 3]))
                 pl.add_mesh(panel, color="#0ea5e9", opacity=0.45, show_edges=True, pickable=False)
             for row in proj.pile_rows:
                 for px, py in row.pile_positions():

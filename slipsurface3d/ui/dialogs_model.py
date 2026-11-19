@@ -695,9 +695,9 @@ class LoadsSupports3DDialog(QDialog):
         # Tab 1: Patch Loads
         w_patch = QWidget()
         vp = QVBoxLayout(w_patch)
-        self.patch_tbl = QTableWidget(0, 6)
+        self.patch_tbl = QTableWidget(0, 7)
         self.patch_tbl.setHorizontalHeaderLabels(
-            ["Name", "X1 [m]", "X2 [m]", "Y1 [m]", "Y2 [m]", "q [kPa]"]
+            ["Name", "X1 [m]", "X2 [m]", "Y1 [m]", "Y2 [m]", "q [kPa]", "From Stage"]
         )
         self.patch_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         vp.addWidget(self.patch_tbl, 1)
@@ -733,9 +733,9 @@ class LoadsSupports3DDialog(QDialog):
         st_form.addRow("Force Application:", self.st_app_cb)
         vb.addWidget(st_box)
 
-        self.bolt_tbl = QTableWidget(0, 7)
+        self.bolt_tbl = QTableWidget(0, 8)
         self.bolt_tbl.setHorizontalHeaderLabels(
-            ["Label", "Head X", "Head Y", "Head Z", "Tip X", "Tip Y", "Tip Z"]
+            ["Label", "Head X", "Head Y", "Head Z", "Tip X", "Tip Y", "Tip Z", "From Stage"]
         )
         self.bolt_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         vb.addWidget(self.bolt_tbl, 1)
@@ -772,17 +772,28 @@ class LoadsSupports3DDialog(QDialog):
         layout.addWidget(btns)
 
         for pl in self._proj_copy.patch_loads:
-            self._insert_patch_row(pl.name, pl.x1, pl.x2, pl.y1, pl.y2, pl.q1)
+            self._insert_patch_row(pl.name, pl.x1, pl.x2, pl.y1, pl.y2, pl.q1, pl.from_stage)
         for b in self._proj_copy.bolts:
             hd, tp = b["head"], b["tip"]
-            self._insert_bolt_row(b.get("label", "Bolt"), hd[0], hd[1], hd[2], tp[0], tp[1], tp[2])
+            self._insert_bolt_row(
+                b.get("label", "Bolt"),
+                hd[0],
+                hd[1],
+                hd[2],
+                tp[0],
+                tp[1],
+                tp[2],
+                int(b.get("from_stage", 0)),
+            )
 
     def _insert_patch_row(
-        self, nm: str, x1: float, x2: float, y1: float, y2: float, q: float
+        self, nm: str, x1: float, x2: float, y1: float, y2: float, q: float, stage: int = 0
     ) -> None:
         r = self.patch_tbl.rowCount()
         self.patch_tbl.insertRow(r)
-        for c, v in enumerate([nm, f"{x1:.2f}", f"{x2:.2f}", f"{y1:.2f}", f"{y2:.2f}", f"{q:.2f}"]):
+        for c, v in enumerate(
+            [nm, f"{x1:.2f}", f"{x2:.2f}", f"{y1:.2f}", f"{y2:.2f}", f"{q:.2f}", str(stage)]
+        ):
             self.patch_tbl.setItem(r, c, QTableWidgetItem(v))
 
     def _add_patch(self) -> None:
@@ -793,12 +804,29 @@ class LoadsSupports3DDialog(QDialog):
         )
 
     def _insert_bolt_row(
-        self, lbl: str, hx: float, hy: float, hz: float, tx: float, ty: float, tz: float
+        self,
+        lbl: str,
+        hx: float,
+        hy: float,
+        hz: float,
+        tx: float,
+        ty: float,
+        tz: float,
+        stage: int = 0,
     ) -> None:
         r = self.bolt_tbl.rowCount()
         self.bolt_tbl.insertRow(r)
         for c, v in enumerate(
-            [lbl, f"{hx:.2f}", f"{hy:.2f}", f"{hz:.2f}", f"{tx:.2f}", f"{ty:.2f}", f"{tz:.2f}"]
+            [
+                lbl,
+                f"{hx:.2f}",
+                f"{hy:.2f}",
+                f"{hz:.2f}",
+                f"{tx:.2f}",
+                f"{ty:.2f}",
+                f"{tz:.2f}",
+                str(stage),
+            ]
         ):
             self.bolt_tbl.setItem(r, c, QTableWidgetItem(v))
 
@@ -870,7 +898,10 @@ class LoadsSupports3DDialog(QDialog):
                 y1 = float(self.patch_tbl.item(r, 3).text())
                 y2 = float(self.patch_tbl.item(r, 4).text())
                 q = float(self.patch_tbl.item(r, 5).text())
-                patches.append(PatchLoad3D(x1=x1, x2=x2, y1=y1, y2=y2, q1=q, q2=q, name=nm))
+                p_stage = max(0, int(float(self.patch_tbl.item(r, 6).text())))
+                patches.append(
+                    PatchLoad3D(x1=x1, x2=x2, y1=y1, y2=y2, q1=q, q2=q, name=nm, from_stage=p_stage)
+                )
 
             st = SupportType3D(
                 name="Primary Support",
@@ -889,8 +920,15 @@ class LoadsSupports3DDialog(QDialog):
                 tx = float(self.bolt_tbl.item(r, 4).text())
                 ty = float(self.bolt_tbl.item(r, 5).text())
                 tz = float(self.bolt_tbl.item(r, 6).text())
+                b_stage = max(0, int(float(self.bolt_tbl.item(r, 7).text())))
                 bolts.append(
-                    {"head": [hx, hy, hz], "tip": [tx, ty, tz], "type": st.name, "label": lbl}
+                    {
+                        "head": [hx, hy, hz],
+                        "tip": [tx, ty, tz],
+                        "type": st.name,
+                        "label": lbl,
+                        "from_stage": b_stage,
+                    }
                 )
 
             self.patch_loads = patches

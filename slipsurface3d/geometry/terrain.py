@@ -562,6 +562,9 @@ class SlopeModel3D:
     weak_layers: list[WeakLayer3D] = field(default_factory=list)
     # Named piezometric surfaces that individual materials can use instead of the water table
     piezo_surfaces: dict[str, HorizonSurface] = field(default_factory=dict)
+    # Staged fills placed on an extruded-region model: (material, surface the fill sits on),
+    # in construction order. Everything above a fill's base surface is that fill.
+    fill_layers: list[tuple[str, HorizonSurface]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.x_max <= self.x_min:
@@ -618,6 +621,8 @@ class SlopeModel3D:
                 idx = name_to_idx.get(reg.material, 0)
                 mask = shapely.contains_xy(reg.polygon, xf, zf)
                 out[mask] = idx
+            for fill_mat, fill_base in self.fill_layers:
+                out[zf > fill_base.z(xf, yf) + 1e-9] = name_to_idx.get(fill_mat, 0)
             return out.reshape(shape)
 
         # Horizon stack: layer 0 is default (below ground); deeper layers override when z <= top_z(x, y)
@@ -703,6 +708,7 @@ class SlopeModel3D:
                 for wl in self.weak_layers
             ],
             piezo_surfaces={k: _bake(h) for k, h in self.piezo_surfaces.items()},
+            fill_layers=list(self.fill_layers),
         )
 
     def ground_mesh(self, nx: int = 64, ny: int = 44) -> pv.StructuredGrid:
@@ -748,7 +754,18 @@ class SlopeModel3D:
         y3 = np.stack([yy, yy], axis=2)
         z3 = np.stack([z_bot, zg], axis=2)
         mat0 = self.profile_regions[0].material if self.profile_regions else "Soil 1"
-        return [(mat0, pv.StructuredGrid(x3, y3, z3))]
+        if not self.fill_layers:
+            return [(mat0, pv.StructuredGrid(x3, y3, z3))]
+        # Staged fills: the original ground is the base of the first fill
+        bases = [np.minimum(zg, np.asarray(h.z(xx, yy), dtype=float)) for _, h in self.fill_layers]
+        blocks = [(mat0, pv.StructuredGrid(x3, y3, np.stack([z_bot, bases[0]], axis=2)))]
+        for k, (fill_mat, _h) in enumerate(self.fill_layers):
+            top = bases[k + 1] if k + 1 < len(bases) else zg
+            if float(np.max(top - bases[k])) > 1e-6:
+                blocks.append(
+                    (fill_mat, pv.StructuredGrid(x3, y3, np.stack([bases[k], top], axis=2)))
+                )
+        return blocks
 
 
 def simple_3d_slope(

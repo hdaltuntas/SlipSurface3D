@@ -12,7 +12,9 @@ from slipsurface3d.cross_section import (
     compare_2d_cross_section,
     export_2d_slp_json,
 )
-from slipsurface3d.geometry.terrain import simple_3d_slope
+from slipsurface3d.design import DesignFactors3D, design_preset
+from slipsurface3d.geometry.terrain import WeakLayer3D, simple_3d_slope
+from slipsurface3d.loads.supports import GeotextileSheet3D, PileRow3D
 from slipsurface3d.probabilistic import (
     ProbabilisticResult3D,
     RandomVarSpec3D,
@@ -27,6 +29,7 @@ from slipsurface3d.project import (
     MaterialSpec3D,
     Project3D,
     ProjectSummary3D,
+    Stage3D,
     SurfaceConfig3D,
 )
 from slipsurface3d.seismic import (
@@ -35,6 +38,7 @@ from slipsurface3d.seismic import (
     estimate_newmark_displacement_3d,
     find_yield_acceleration_3d,
 )
+from slipsurface3d.stages import StageResult3D, run_staged_analysis_3d, stage_project
 
 
 def create_simple_slope_project(
@@ -111,7 +115,10 @@ def solve(
     *,
     methods: Sequence[str] | None = None,
     effort: str | None = None,
+    algorithm: str | None = None,
     sao: bool | None = None,
+    n_local_minima: int | None = None,
+    design: str | DesignFactors3D | None = None,
     n_workers: int | None = None,
 ) -> AnalysisResults3D:
     """Run 3D limit-equilibrium analysis with optional non-destructive overrides."""
@@ -122,8 +129,14 @@ def solve(
             proj.surface_config.primary_method = proj.analysis.methods[0]
     if effort is not None:
         proj.surface_config.effort = effort
+    if algorithm is not None:
+        proj.surface_config.algorithm = algorithm
     if sao is not None:
         proj.surface_config.sao_enabled = sao
+    if n_local_minima is not None:
+        proj.surface_config.n_local_minima = int(n_local_minima)
+    if design is not None:
+        proj.design = design_preset(design) if isinstance(design, str) else design
     if n_workers is not None:
         proj.analysis.n_workers = n_workers
     return run_analysis_3d(proj)
@@ -183,6 +196,11 @@ def compare_2d_section(
     return compare_2d_cross_section(project, results=results, y0=y0)
 
 
+def run_stages(project: Project3D) -> list[StageResult3D]:
+    """Analyse the initial ground and every construction stage defined on ``project``."""
+    return run_staged_analysis_3d(project)
+
+
 def batch_solve(
     items: Sequence[Project3D | str | Path],
     *,
@@ -203,16 +221,23 @@ def batch_solve(
 __all__ = [
     "AnalysisResults3D",
     "CrossSection2DResult",
+    "DesignFactors3D",
+    "GeotextileSheet3D",
     "NewmarkResult3D",
+    "PileRow3D",
     "ProbabilisticResult3D",
     "Project3D",
     "RandomVarSpec3D",
     "SensitivityCurve3D",
     "SensitivityParamSpec3D",
+    "Stage3D",
+    "StageResult3D",
+    "WeakLayer3D",
     "YieldAccelerationResult3D",
     "batch_solve",
     "compare_2d_section",
     "create_simple_slope_project",
+    "design_preset",
     "export_2d_slp_json",
     "find_ky",
     "load_example",
@@ -220,6 +245,8 @@ __all__ = [
     "report_text_3d",
     "run_probabilistic",
     "run_sensitivity",
+    "run_stages",
     "save_project",
     "solve",
+    "stage_project",
 ]

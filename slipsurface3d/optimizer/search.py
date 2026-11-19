@@ -54,6 +54,12 @@ SEARCH_ALGORITHMS: dict[str, str] = {
 PSO_INERTIA = 0.7298
 PSO_ACCEL = 1.4962
 
+# Local polish: Nelder-Mead starts, restarts from the incumbent, and simplex size
+# (fraction of each parameter's search range).
+NM_STARTS = 3
+NM_RESTARTS = 2
+NM_STEP = 0.06
+
 
 @dataclass
 class SearchSettings3D:
@@ -358,6 +364,15 @@ def _find_local_minima(
         minima.append(describe(polished, final[0], final[1]))
 
     return minima, evals
+
+
+def _initial_simplex(u0: np.ndarray, step: float) -> np.ndarray:
+    """Nelder-Mead simplex around ``u0`` in the unit box, stepping inward near the walls."""
+    dim = len(u0)
+    simplex = np.tile(u0, (dim + 1, 1))
+    for k in range(dim):
+        simplex[k + 1, k] = u0[k] + step if u0[k] + step <= 1.0 else u0[k] - step
+    return simplex
 
 
 def _levy_step(rng: np.random.Generator, dim: int, beta: float = 1.5) -> np.ndarray:
@@ -773,7 +788,6 @@ def search_critical_surface_3d(
             pool_ctx.shutdown(wait=True)
 
     if not cancelled and fine_best_fos < PENALTY_FOS:
-        u0 = np.clip((fine_best_vec - lo) / span, 0.0, 1.0)
 
         def nm_obj(u_norm: np.ndarray) -> float:
             if cancel_check is not None and cancel_check():
@@ -782,15 +796,40 @@ def search_critical_surface_3d(
                 return PENALTY_FOS
             return eval_vec(lo + u_norm * span, fine=True)
 
-        nm = minimize(
-            nm_obj,
-            u0,
-            method="Nelder-Mead",
-            options={"maxfev": nm_fev, "xatol": 1e-3, "fatol": 5e-4},
+        # Local polish: Nelder-Mead from the best full-resolution candidates, then restarts
+        # from the incumbent with a fresh, smaller simplex. The FoS valley around the critical
+        # surface is flat and slightly noisy (column discretisation), so a single short run
+        # stalls at a seed-dependent point; several starts and restarts reduce that scatter.
+        ranked = sorted(
+            (f, i) for i, f in enumerate(fine_fits) if f < PENALTY_FOS and np.isfinite(f)
         )
-        if float(nm.fun) < fine_best_fos:
-            fine_best_fos = float(nm.fun)
-            fine_best_vec = lo + np.clip(nm.x, 0.0, 1.0) * span
+        starts: list[np.ndarray] = []
+        for _f, i in ranked:
+            u_i = np.clip((fine_vecs[i] - lo) / span, 0.0, 1.0)
+            if all(float(np.max(np.abs(u_i - u_j))) > 0.02 for u_j in starts):
+                starts.append(u_i)
+            if len(starts) >= NM_STARTS:
+                break
+        rounds = [(u_s, NM_STEP) for u_s in starts] + [(None, NM_STEP / 2.0)] * NM_RESTARTS
+        for u_start, step in rounds:
+            if cancel_check is not None and cancel_check():
+                break
+            if u_start is None:
+                u_start = np.clip((fine_best_vec - lo) / span, 0.0, 1.0)
+            nm = minimize(
+                nm_obj,
+                u_start,
+                method="Nelder-Mead",
+                options={
+                    "maxfev": nm_fev,
+                    "xatol": 1e-3,
+                    "fatol": 2e-4,
+                    "initial_simplex": _initial_simplex(u_start, step),
+                },
+            )
+            if float(nm.fun) < fine_best_fos:
+                fine_best_fos = float(nm.fun)
+                fine_best_vec = lo + np.clip(nm.x, 0.0, 1.0) * span
 
     crit_surface: SlipSurface3D = _decode_surface(
         fine_best_vec, base_kind, default_az, settings.optimize_azimuth

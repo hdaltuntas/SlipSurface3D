@@ -10,8 +10,9 @@ from typing import Any
 import numpy as np
 
 from slipsurface3d.analysis import AnalysisResults3D, run_analysis_3d
+from slipsurface3d.design import apply_design_to_loads
 from slipsurface3d.geometry.surfaces import EllipsoidSurface, SlipSurface3D
-from slipsurface3d.geometry.terrain import HorizonSurface, SlopeModel3D
+from slipsurface3d.geometry.terrain import HorizonSurface, SlopeModel3D, WeakLayer3D
 from slipsurface3d.lem.columns import ColumnOptions, discretize_columns
 from slipsurface3d.lem.solvers import solve_surface_3d
 from slipsurface3d.loads.supports import LoadSet3D, PatchLoad3D
@@ -147,6 +148,33 @@ def compare_2d_cross_section(
         if zw_prof is not None
         else None
     )
+    weak_2d = [
+        WeakLayer3D(
+            name=wl.name,
+            material=wl.material,
+            horizon=HorizonSurface.from_extruded(
+                np.column_stack([xs_prof, wl.horizon.z(xs_prof, ys_const)]),
+                name=wl.horizon.name,
+            ),
+            thickness=wl.thickness,
+        )
+        for wl in mdl3d.weak_layers
+    ]
+    piezo_2d = {
+        k: HorizonSurface.from_extruded(
+            np.column_stack([xs_prof, h.z(xs_prof, ys_const)]), name=h.name
+        )
+        for k, h in mdl3d.piezo_surfaces.items()
+    }
+    fill_2d = [
+        (
+            mat_name,
+            HorizonSurface.from_extruded(
+                np.column_stack([xs_prof, h.z(xs_prof, ys_const)]), name=h.name
+            ),
+        )
+        for mat_name, h in mdl3d.fill_layers
+    ]
     mdl_2d = SlopeModel3D(
         x_min=mdl3d.x_min,
         x_max=mdl3d.x_max,
@@ -158,6 +186,9 @@ def compare_2d_cross_section(
         profile_regions=list(mdl3d.profile_regions),
         water_table=wt_2d,
         name=f"{mdl3d.name} [2D Section y={y_sec:.2f} m]",
+        weak_layers=weak_2d,
+        piezo_surfaces=piezo_2d,
+        fill_layers=fill_2d,
     )
 
     # Build exact 2D extruded slip surface along y = y_sec
@@ -222,7 +253,10 @@ def compare_2d_cross_section(
         azimuth_deg=az_2d,
         min_depth=col_opts_3d.min_depth,
         min_columns=4,
-        loads=LoadSet3D(patch_loads=patch_2d, tension_crack=project.tension_crack),
+        loads=apply_design_to_loads(
+            LoadSet3D(patch_loads=patch_2d, tension_crack=project.tension_crack),
+            project.design,
+        ),
         pore_pressure_fn=col_opts_3d.pore_pressure_fn,
     )
 

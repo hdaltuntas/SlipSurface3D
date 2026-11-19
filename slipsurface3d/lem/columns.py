@@ -679,6 +679,7 @@ def discretize_columns(
     # A material with its own piezometric surface uses it; the others use the water table.
     submerged: np.ndarray | None = None
     level_top: np.ndarray | None = None
+    h_pond_grid: np.ndarray | None = None
     if opts.pore_mode == "water_table" and (z_wt is not None or model.piezo_surfaces):
         level = np.full(z_samples.shape, -np.inf, dtype=float)
         if z_wt is not None:
@@ -695,6 +696,9 @@ def discretize_columns(
         y_b = np.broadcast_to(y[:, None], z_samples.shape)
         # (small tolerance: interpolation round-off leaves ~1e-13 kPa above the water level)
         submerged = np.asarray(opts.pore_pressure_fn(x_b, y_b, z_samples), dtype=float) > 1e-6
+        # A positive pressure at the ground surface is water standing on it
+        u_ground = np.maximum(np.asarray(opts.pore_pressure_fn(x, y, zt), dtype=float), 0.0)
+        h_pond_grid = u_ground / opts.gamma_w
 
     if submerged is not None:
         gam_samples = np.where(submerged, gamma_sat[mat_sub], gamma_dry[mat_sub])
@@ -713,6 +717,8 @@ def discretize_columns(
     if level_top is not None:
         h_pond = np.where(np.isfinite(level_top), np.maximum(level_top - zt, 0.0), 0.0)
         W_pond = opts.gamma_w * h_pond * dA
+    elif h_pond_grid is not None:
+        W_pond = opts.gamma_w * h_pond_grid * dA
 
     W = W_soil + W_pond
 

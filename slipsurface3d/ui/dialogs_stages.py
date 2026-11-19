@@ -55,7 +55,10 @@ class _RecordTable(QTableWidget):
                 cb.setCurrentIndex(max(0, cb.findText(str(value))))
                 self.setCellWidget(row, c_idx, cb)
             else:
-                text = f"{value:g}" if isinstance(value, float) else str(value)
+                if value is None:
+                    text = ""
+                else:
+                    text = f"{value:g}" if isinstance(value, float) else str(value)
                 self.setItem(row, c_idx, QTableWidgetItem(text))
 
     def remove_current(self) -> None:
@@ -74,12 +77,17 @@ class _RecordTable(QTableWidget):
                     continue
                 item = self.item(row, c_idx)
                 text = item.text().strip() if item is not None else ""
-                if isinstance(getattr(template, col.attr), float):
+                sample = getattr(template, col.attr)
+                if isinstance(sample, (int, float)) and not isinstance(sample, bool):
                     try:
-                        kwargs[col.attr] = float(text.replace(",", "."))
+                        number = float(text.replace(",", "."))
+                        if isinstance(sample, int) and number != int(number):
+                            raise ValueError
+                        kwargs[col.attr] = int(number) if isinstance(sample, int) else number
                     except ValueError as exc:
+                        kind = "a whole number" if isinstance(sample, int) else "a number"
                         raise ValueError(
-                            f"Row {row + 1}, '{col.header}': '{text}' is not a number."
+                            f"Row {row + 1}, '{col.header}': '{text}' is not {kind}."
                         ) from exc
                 else:
                     kwargs[col.attr] = text
@@ -96,7 +104,7 @@ class SupportsStagesDialog(QDialog):
     def __init__(self, project: Project3D, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Geotextiles, Pile Rows & Construction Stages")
-        self.resize(980, 460)
+        self.resize(1180, 460)
         self._project = project
         self.geotextiles: list[GeotextileSheet3D] = list(project.geotextiles)
         self.pile_rows: list[PileRow3D] = list(project.pile_rows)
@@ -114,21 +122,26 @@ class SupportsStagesDialog(QDialog):
                 _Column("x2", "X max [m]"),
                 _Column("y1", "Y min [m]"),
                 _Column("y2", "Y max [m]"),
-                _Column("z", "Elevation [m]"),
+                _Column("z", "Centre Elev. [m]"),
+                _Column("dip_deg", "Dip [°]"),
+                _Column("dip_dir_deg", "Dip Dir [°]"),
+                _Column("azimuth_deg", "Tension Dir [°]"),
                 _Column("tensile_kn_m", "Tensile [kN/m]"),
                 _Column("pullout_kpa", "Pullout [kPa]"),
-                _Column("anchorage_kn_m", "Face Anchorage [kN/m]"),
-                _Column("direction", "Direction", ["x", "y"]),
+                _Column("anchorage_kn_m", "Face Anch. [kN/m]"),
                 _Column("strip_spacing", "Strip Width [m]"),
                 _Column("application", "Application", apps),
+                _Column("from_stage", "From Stage"),
             ]
         )
         tabs.addTab(
             self._page(
                 self.geo_table,
-                "Horizontal reinforcement sheets. Each is cut strip by strip where the slip "
-                "surface crosses it: T = min(tensile, pullout × anchored length, face "
-                "anchorage + pullout × length in the sliding mass) per metre width.",
+                "Planar reinforcement sheets, horizontal or dipping. Directions are in plan: "
+                "0° = +X, 90° = +Y. Each sheet is cut strip by strip where the slip surface "
+                "crosses it: T = min(tensile, pullout × anchored length, face anchorage + "
+                "pullout × length in the sliding mass) per metre width. 'From Stage' is the "
+                "construction stage at which it is installed (0 = from the start).",
                 self._add_geotextile,
             ),
             "Geotextiles / Geogrids",
@@ -145,6 +158,7 @@ class SupportsStagesDialog(QDialog):
                 _Column("length_m", "Pile Length [m]"),
                 _Column("shear_kn", "Shear per Pile [kN]"),
                 _Column("application", "Application", apps),
+                _Column("from_stage", "From Stage"),
             ]
         )
         tabs.addTab(
@@ -168,6 +182,7 @@ class SupportsStagesDialog(QDialog):
                 _Column("level", "Floor / Crest Level [m]"),
                 _Column("batter", "Batter H:V"),
                 _Column("fill_material", "Fill Material", ["", *mats]),
+                _Column("water_level", "Water Level [m]"),
             ]
         )
         tabs.addTab(
@@ -175,7 +190,8 @@ class SupportsStagesDialog(QDialog):
                 self.stage_table,
                 "Stages are built in order. Inside the box the ground is cut down to "
                 "(excavation) or built up to (fill) the level, then battered back to the "
-                "existing ground. Run them with Analysis → Run Construction Stages.",
+                "existing ground. 'Water Level' sets a flat water table from that stage on "
+                "(blank = unchanged). Run them with Analysis → Run Construction Stages.",
                 self._add_stage,
             ),
             "Construction Stages",
@@ -287,9 +303,8 @@ class StagedAnalysisDialog(QDialog):
 
         layout = QVBoxLayout(self)
         note = QLabel(
-            "Each stage is an independent limit-equilibrium analysis of the ground as it "
-            "stands after that stage. Water table, loads and supports are the same in every "
-            "stage."
+            "Each stage is solved for the ground, water level and the loads and supports in "
+            "force at that stage (limit equilibrium carries no stress history)."
         )
         note.setWordWrap(True)
         layout.addWidget(note)

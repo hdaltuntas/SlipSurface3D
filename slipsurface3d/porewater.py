@@ -4,11 +4,10 @@ Used for pore pressures exported from an external seepage / consolidation analys
 read from piezometers. Inside the convex hull of the samples the pressure is linearly
 interpolated; outside it the nearest sample is used.
 
-Interpolated values are clamped at zero. Where the samples come from a seepage model,
-keep the negative pressures above the phreatic surface: with them the zero-pressure line
-is located exactly, whereas samples already clamped to zero smear it by up to one sample
-spacing. Water standing above the ground surface is not represented by a pressure grid;
-model it with a water table or a surcharge load.
+Interpolated values are clamped at zero. Samples that were clamped to zero above the
+phreatic surface are given their signed pressure back first (see ``restore_suction``), so
+the zero-pressure line is located between samples rather than smeared across them. A
+positive pressure at the ground surface is treated as standing water of that head.
 """
 
 from __future__ import annotations
@@ -22,14 +21,60 @@ from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 from scipy.spatial import QhullError
 
 
+def restore_suction(samples: np.ndarray, gamma_w: float = 9.81) -> tuple[np.ndarray, int]:
+    """Give zero-clamped samples above the phreatic surface a signed (negative) pressure.
+
+    Seepage exports often clamp pore pressure at zero above the water. Interpolating such
+    data smears the zero-pressure line by up to one sample spacing. Where samples share a
+    plan position (a vertical string, as in gridded exports and piezometer strings), every
+    zero above the highest positive sample is replaced by the pressure extrapolated upward
+    from that sample, using the gradient of the two highest positive samples (hydrostatic
+    ``-gamma_w`` when there is only one). Data that already contains negative pressures, and
+    plan positions with a single sample, are left untouched.
+
+    Returns the adjusted samples and the number of values changed.
+    """
+    pts = np.array(samples, dtype=float, copy=True)
+    if np.any(pts[:, 3] < 0.0):
+        return pts, 0
+    _keys, inverse = np.unique(np.round(pts[:, :2], 6), axis=0, return_inverse=True)
+    inverse = np.asarray(inverse).ravel()
+    order = np.lexsort((pts[:, 2], inverse))
+    bounds = np.flatnonzero(np.r_[True, inverse[order][1:] != inverse[order][:-1], True])
+    changed = 0
+    for start, stop in zip(bounds[:-1], bounds[1:], strict=True):
+        idx = order[start:stop]  # one vertical string, ascending z
+        if len(idx) < 2:
+            continue
+        u = pts[idx, 3]
+        positive = np.flatnonzero(u > 0.0)
+        if len(positive) == 0 or positive[-1] == len(idx) - 1:
+            continue
+        top = int(positive[-1])
+        grad = -gamma_w
+        if top >= 1 and u[top - 1] > 0.0:
+            dz = pts[idx[top], 2] - pts[idx[top - 1], 2]
+            if dz > 1e-9:
+                measured = (u[top] - u[top - 1]) / dz
+                if measured < 0.0:
+                    grad = float(measured)
+        for j in range(top + 1, len(idx)):
+            value = u[top] + grad * (pts[idx[j], 2] - pts[idx[top], 2])
+            if value < 0.0:
+                pts[idx[j], 3] = value
+                changed += 1
+    return pts, changed
+
+
 class PorePressureGrid3D:
     """Interpolator over scattered pore-pressure samples ``(x, y, z, u)`` [m, m, m, kPa]."""
 
-    def __init__(self, samples: Any) -> None:
-        pts = np.asarray(samples, dtype=float)
-        if pts.ndim != 2 or pts.shape[1] != 4 or len(pts) < 1 or not np.all(np.isfinite(pts)):
+    def __init__(self, samples: Any, gamma_w: float = 9.81) -> None:
+        raw = np.asarray(samples, dtype=float)
+        if raw.ndim != 2 or raw.shape[1] != 4 or len(raw) < 1 or not np.all(np.isfinite(raw)):
             raise ValueError("Pore-pressure grid needs finite rows of (x, y, z, u).")
-        self.samples = pts
+        self.samples = raw  # as supplied
+        pts, self.n_restored = restore_suction(raw, gamma_w)
         self._nearest = NearestNDInterpolator(pts[:, :3], pts[:, 3])
         self._linear: LinearNDInterpolator | None = None
         if len(pts) >= 5:
