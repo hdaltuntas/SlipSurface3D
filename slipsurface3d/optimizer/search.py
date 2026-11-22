@@ -963,8 +963,10 @@ class SafetyMap3D:
         grid["MinFoS"] = fos_filled.ravel(order="F")
         grid["TrialCount"] = self.trial_count.ravel(order="F").astype(float)
         grid["CoveredMask"] = valid.ravel(order="F").astype(float)
-        surf = grid.extract_surface()
-        return surf.threshold(0.5, scalars="CoveredMask", preference="point").extract_surface()
+        surf = grid.extract_surface(algorithm="dataset_surface")
+        return surf.threshold(0.5, scalars="CoveredMask", preference="point").extract_surface(
+            algorithm="dataset_surface"
+        )
 
 
 def compute_safety_map_3d(

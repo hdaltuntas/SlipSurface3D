@@ -177,9 +177,9 @@ class SlipSurface3D(ABC):
         grid = pv.StructuredGrid(xx, yy, zz_filled)
         grid["valid_mask"] = valid.ravel(order="F").astype(float)
         grid["Elevation"] = zz_filled.ravel(order="F")
-        surf = grid.extract_surface()
+        surf = grid.extract_surface(algorithm="dataset_surface")
         clipped = surf.threshold(0.5, scalars="valid_mask", preference="point")
-        return clipped.extract_surface()
+        return clipped.extract_surface(algorithm="dataset_surface")
 
 
 @dataclass
@@ -602,7 +602,7 @@ class MeshSlipSurface(SlipSurface3D):
 
     @classmethod
     def from_polydata(cls, mesh: pv.DataSet) -> MeshSlipSurface:
-        surf = mesh.extract_surface().triangulate().clean()
+        surf = mesh.extract_surface(algorithm="dataset_surface").triangulate().clean()
         pts = np.asarray(surf.points, dtype=float)
         if surf.n_cells == 0 or len(pts) < 3:
             raise ValueError("PolyData slip surface has no triangles.")

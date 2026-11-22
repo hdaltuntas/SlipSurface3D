@@ -17,7 +17,7 @@ from slipsurface3d.geometry.terrain import HorizonSurface, SlopeModel3D
 
 def _polydata_triangles(mesh: pv.DataSet) -> tuple[np.ndarray, np.ndarray]:
     """Extract (vertices [N, 3], triangle_indices [M, 3]) from any PyVista dataset."""
-    surf = mesh.extract_surface().triangulate()
+    surf = mesh.extract_surface(algorithm="dataset_surface").triangulate()
     if surf.n_points == 0 or surf.n_cells == 0:
         return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=int)
     pts = np.asarray(surf.points, dtype=float)
