@@ -49,8 +49,9 @@ from slipsurface3d.exchange import (
 from slipsurface3d.lem.solvers import METHODS_3D
 from slipsurface3d.project import (
     EXAMPLE_PROJECTS_3D,
+    MaterialSpec3D,
     Project3D,
-    extruded_acads_1a_project,
+    ProjectSummary3D,
     import_2d_project,
 )
 from slipsurface3d.report.pdf import export_pdf_report_3d
@@ -115,9 +116,30 @@ def _safe_icon(name: str, color: str) -> QIcon | None:
 class MainWindow3D(QMainWindow):
     """Unified 3D Modeler + Interpret Main Window."""
 
+    @staticmethod
+    def _empty_project() -> Project3D:
+        return Project3D(
+            summary=ProjectSummary3D(title="Untitled 3D Project"),
+            materials=[MaterialSpec3D()],
+        )
+
+    def _has_geometry(self) -> bool:
+        return self.project.ground is not None or bool(self.project.boreholes)
+
+    def _require_geometry(self, title: str) -> bool:
+        if self._has_geometry():
+            return True
+        QMessageBox.information(
+            self,
+            title,
+            "No 3D geometry is defined yet. Create a parametric slope, define boreholes, "
+            "or import a 2D/3D surface first.",
+        )
+        return False
+
     def __init__(self, project: Project3D | None = None) -> None:
         super().__init__()
-        self.project: Project3D = project or extruded_acads_1a_project()
+        self.project: Project3D = project if project is not None else self._empty_project()
         self.results: AnalysisResults3D | None = None
         self.project_path: Path | None = None
         self._undo_stack: list[dict[str, Any]] = []
@@ -150,6 +172,10 @@ class MainWindow3D(QMainWindow):
 
         # File Menu
         file_m = mb.addMenu("&File")
+        self.act_new_empty = QAction("New Empty Project", self)
+        self.act_new_empty.triggered.connect(self.new_empty_project)
+        file_m.addAction(self.act_new_empty)
+
         self.act_new = QAction("New Parametric 3D Slope...", self)
         self.act_new.setShortcut(QKeySequence.StandardKey.New)
         self.act_new.triggered.connect(self.new_parametric_slope)
@@ -543,6 +569,15 @@ class MainWindow3D(QMainWindow):
 
     def _populate_results_panel(self) -> None:
         self.res_table.setRowCount(0)
+        if not self._has_geometry():
+            self.fos_banner.setText(
+                "Empty project — create a slope, import a surface, or open a project."
+            )
+            self.col_info.setPlainText(
+                "No 3D geometry loaded yet.\n"
+                "Use File → New Parametric 3D Slope, Import 2D/STL/DEM/CSV, or Boreholes."
+            )
+            return
         if self.results is None:
             self.fos_banner.setText("Model ready — press F9 to compute 3D FoS.")
             self.col_info.setPlainText("Run 3D stability analysis to inspect active columns.")
@@ -606,6 +641,14 @@ class MainWindow3D(QMainWindow):
         )
 
     # ------------------------------------------------------- Actions & Dialogs
+    def new_empty_project(self) -> None:
+        self._push_undo()
+        self.project = self._empty_project()
+        self.project_path = None
+        self.results = None
+        self._refresh_all(reset_camera=True)
+        self.statusBar().showMessage("Created new empty 3D project.")
+
     def new_parametric_slope(self) -> None:
         dlg = ParametricSlopeDialog(self.project, self)
         if dlg.exec():
@@ -779,6 +822,11 @@ class MainWindow3D(QMainWindow):
             self._refresh_all(reset_camera=False)
 
     def compute_analysis(self, synchronous: bool = False) -> None:
+        if not self._has_geometry():
+            if synchronous:
+                raise ValueError("Cannot compute: project has no 3D geometry defined.")
+            self._require_geometry("Compute 3D Analysis")
+            return
         if synchronous:
             self.results = run_analysis_3d(self.project)
             self._refresh_all(reset_camera=False)
@@ -848,19 +896,27 @@ class MainWindow3D(QMainWindow):
         dlg.exec()
 
     def open_probabilistic_dialog(self) -> None:
+        if not self._require_geometry("Probabilistic & Sensitivity Analysis"):
+            return
         dlg = ProbabilisticSensitivity3DDialog(self.project, self.results, self)
         dlg.exec()
 
     def open_seismic_dialog(self) -> None:
+        if not self._require_geometry("Seismic Yield Acceleration & Newmark"):
+            return
         dlg = SeismicNewmark3DDialog(self.project, self.results, self)
         dlg.exec()
 
     def open_cross_section_dialog(self) -> None:
+        if not self._require_geometry("2D Cross-Section Comparison"):
+            return
         dlg = CrossSectionComparisonDialog(self.project, self.results, self)
         dlg.exec()
 
     # ------------------------------------------------------- Exports / Imports
     def export_dxf_dialog(self) -> None:
+        if not self._require_geometry("Export 3D DXF"):
+            return
         fn, _ = QFileDialog.getSaveFileName(
             self, "Export 3D DXF", "slope_3d.dxf", "DXF Files (*.dxf)"
         )
@@ -878,6 +934,8 @@ class MainWindow3D(QMainWindow):
         self.statusBar().showMessage(f"Exported 3D DXF to {fn}")
 
     def export_obj_dialog(self) -> None:
+        if not self._require_geometry("Export Wavefront OBJ"):
+            return
         fn, _ = QFileDialog.getSaveFileName(
             self, "Export Wavefront OBJ", "slope_3d.obj", "OBJ Files (*.obj)"
         )
@@ -898,6 +956,8 @@ class MainWindow3D(QMainWindow):
         self.statusBar().showMessage(f"Exported OBJ mesh to {fn}")
 
     def export_stl_dialog(self) -> None:
+        if not self._require_geometry("Export Binary STL"):
+            return
         fn, _ = QFileDialog.getSaveFileName(
             self, "Export Binary STL", "slope_3d.stl", "STL Files (*.stl)"
         )
@@ -918,6 +978,8 @@ class MainWindow3D(QMainWindow):
         self.statusBar().showMessage(f"Exported Binary STL mesh to {fn}")
 
     def export_dem_dialog(self) -> None:
+        if not self._require_geometry("Export ESRI ASCII DEM"):
+            return
         fn, _ = QFileDialog.getSaveFileName(
             self, "Export ESRI ASCII DEM", "terrain.asc", "ESRI ASCII Grid (*.asc)"
         )

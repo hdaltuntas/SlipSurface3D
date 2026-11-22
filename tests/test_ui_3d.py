@@ -27,6 +27,8 @@ def test_main_window_3d_compute_views_undo_and_exports(qapp, tmp_path: Path):
     qapp.processEvents()
 
     assert win.viewport.is_offscreen
+    assert win.project.ground is None
+    assert win.project.summary.title == "Untitled 3D Project"
     win.load_builtin_example("zhang_1988_homog")
     win.compute_analysis(synchronous=True)
     assert win.results is not None

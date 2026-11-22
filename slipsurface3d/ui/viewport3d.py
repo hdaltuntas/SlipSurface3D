@@ -239,6 +239,18 @@ class Viewport3D(QWidget):
 
         proj = self._project
         res = self._results
+        if res is None and proj.ground is None and not proj.boreholes:
+            pl.add_text(
+                "Empty 3D Project\nUse File → New Parametric 3D Slope, Import, or Boreholes.",
+                position="upper_left",
+                font_size=10,
+                color=fg_col,
+            )
+            pl.add_axes()
+            if reset_camera:
+                self._apply_camera(pl, self._camera_preset)
+            return
+
         model = res.model if res is not None else proj.build_model()
         mat_colors = {m.name: m.color for m in proj.materials}
         y_mid = 0.5 * (model.y_min + model.y_max)
