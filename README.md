@@ -26,8 +26,8 @@
   - **Weak layers along any surface** (`WeakLayer3D`: plane, DEM, STL/OBJ, XYZ), with optional seam thickness: slip surfaces that would pass below a layer are clipped to run along it and take its strength material there, in both user-surface and search modes
   - **Per-material piezometric surfaces** (`piezo_surfaces`, `MaterialSpec3D.piezo`) and **scattered pore-pressure grids** (`pore_mode = "grid"`, `x, y, z, u` CSV import)
 - **Areal Supports & Construction Stages**:
-  - **Geotextile / geogrid sheets** and **pile rows** (`GeotextileSheet3D`, `PileRow3D`) cut individually by the 3D slip surface
-  - **Staged excavations and fills** (`Stage3D`, `run_staged_analysis_3d`) with a factor of safety per stage
+  - **Geotextile / geogrid sheets** (horizontal or dipping) and **pile rows** (`GeotextileSheet3D`, `PileRow3D`) cut individually by the 3D slip surface
+  - **Staged excavations and fills** (`Stage3D`, `run_staged_analysis_3d`) with a factor of safety per stage; stages can change the water level, and loads and supports act from their own `from_stage`
 - **Probabilistic Reliability, Seismic $k_y$/Newmark & 3D Seepage**:
   - **Latin Hypercube & Monte Carlo 3D Reliability** ($P_f$, $\beta_N$, $\beta_{LN}$) & **Tornado Sensitivity** (`slipsurface3d/probabilistic.py`)
   - **Critical Yield Acceleration $k_y$** ($F_s(k_y) = 1.0$) & **Newmark Permanent Displacement** (Jibson 2007, Ambraseys & Menu 1988, and exact accelerogram double integration in `slipsurface3d/seismic.py`)
@@ -49,9 +49,11 @@ python3 main.py --check
 # Full 6-benchmark verification audit
 python3 scripts/audit_verification_3d.py
 
-# Launch interactive 3D desktop UI
+# Launch interactive 3D desktop UI (opens with an empty project)
 python3 main.py
 ```
+
+The desktop application starts with an empty project. Build a model with **File → New Parametric 3D Slope**, import a 2D `.slp.json`, STL/DEM/CSV terrain or boreholes, or load one of the verification cases under **File → Built-in 3D Examples & Benchmarks**.
 
 Interactive analyses default to a `28 × 24` column grid (`nx × ny`) so searches stay responsive. Published verification cases in [`docs/VERIFICATION_3D.md`](docs/VERIFICATION_3D.md) use `64–72` columns per axis. Raise `nx` / `ny` under **Analysis → Solvers, Columns & Slip Surface Settings** when comparing against published Factors of Safety.
 

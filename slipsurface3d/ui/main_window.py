@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,9 @@ class _ComputeWorker3D(QThread):
             self.failed.emit(str(exc))
 
 
+_log = logging.getLogger(__name__)
+
+
 def _safe_icon(name: str, color: str) -> QIcon | None:
     if QApplication.instance() is None:
         return None
@@ -110,6 +114,7 @@ def _safe_icon(name: str, color: str) -> QIcon | None:
         ic = qta.icon(name, color=color)
         return ic if isinstance(ic, QIcon) else None
     except Exception:
+        _log.debug("Icon %r unavailable", name, exc_info=True)
         return None
 
 
@@ -124,7 +129,7 @@ class MainWindow3D(QMainWindow):
         )
 
     def _has_geometry(self) -> bool:
-        return self.project.ground is not None or bool(self.project.boreholes)
+        return self.project.has_geometry
 
     def _require_geometry(self, title: str) -> bool:
         if self._has_geometry():

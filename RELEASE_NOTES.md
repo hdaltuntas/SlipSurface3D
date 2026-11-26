@@ -1,6 +1,10 @@
-# Release Notes — SlipSurfaceIQ-3D `2026.7.1`
+# Release Notes — SlipSurfaceIQ-3D `0.1.0`
 
-Standalone 3D companion to SlipSurfaceIQ-LE. Licensed under GNU AGPL v3 or later.
+First public pre-release of the standalone 3D companion to SlipSurfaceIQ-LE. Licensed under GNU AGPL v3 or later.
+
+## Desktop start-up
+- The application opens with an empty project (`Untitled 3D Project`) instead of a built-in example. File → New Empty Project resets to it; the built-in benchmarks remain under File → Built-in 3D Examples & Benchmarks.
+- An empty project (no ground surface or boreholes yet) can be saved and reopened. Analyses, exports and the probabilistic / seismic / cross-section tools ask for geometry first.
 
 ## Solvers
 - 3D Ordinary / Fellenius, Simplified Bishop, Simplified and Corrected Janbu, and Rigorous Spencer (Lam & Fredlund 1993).
@@ -25,14 +29,15 @@ Standalone 3D companion to SlipSurfaceIQ-LE. Licensed under GNU AGPL v3 or later
 ## Weak layers and pore-water options
 - Weak layers (`Project3D.weak_layers`) defined by any single-valued surface: a plane, DEM, STL/OBJ mesh or XYZ points. A slip surface that would pass below a weak layer is clipped to run along it (`WeakLayerClippedSurface`) and the column bases on it take the layer's strength material. Applies to user surfaces and to every search trial. An optional seam `thickness` also applies the weak strength to slip surfaces passing through the band above the layer surface; with it the Zhang (1988) weak-seam case is reproduced to 0.1%. Weak layers never change unit weights.
 - Per-material piezometric surfaces: a material can take its basal pore pressure from a named piezometric surface instead of the global water table. Saturated unit weights and ponded water follow the same surface, so a piezometric surface and an identical water table give identical results.
-- Scattered pore-pressure grid (`pore_mode = "grid"`): `x, y, z, u` samples from an external seepage analysis or piezometers, linearly interpolated inside the samples and taken from the nearest sample outside; the analysis warns when column bases fall outside the samples. Soil is saturated wherever the interpolated pressure is positive. Keep negative pressures above the phreatic surface in the samples so the zero-pressure line is located exactly. Water standing above the ground is not represented by a grid.
+- Scattered pore-pressure grid (`pore_mode = "grid"`): `x, y, z, u` samples from an external seepage analysis or piezometers, linearly interpolated inside the samples and taken from the nearest sample outside; the analysis warns when column bases fall outside the samples. Soil is saturated wherever the interpolated pressure is positive. Keep negative pressures above the phreatic surface in the samples so the zero-pressure line is located exactly. Samples clamped at zero above the water are given back a signed (suction) pressure along vertical sample strings, and a positive pressure at the ground surface is treated as water ponded on it.
 - New dialog: Model → Weak Layers, Piezometric Surfaces & Pore Pressure Grid.
 
 ## Areal supports, construction stages and particle swarm
-- Geotextile / geogrid sheets (`GeotextileSheet3D`): horizontal reinforcement analysed strip by strip, limited by tensile strength, pullout over the anchored length, and face anchorage plus pullout inside the sliding mass.
+- Geotextile / geogrid sheets (`GeotextileSheet3D`): planar reinforcement, horizontal or dipping (`dip_deg`, `dip_dir_deg`) with tension along a plan direction (`azimuth_deg`), analysed strip by strip and limited by tensile strength, pullout over the anchored length, and face anchorage plus pullout inside the sliding mass.
 - Pile rows (`PileRow3D`): vertical piles from the ground surface that resist with their shear capacity where they pass through the slip surface.
-- Construction stages (`Stage3D`, `slipsurface3d.stages`): box excavations and fills applied cumulatively, with a fill material inserted above the previous ground. `run_staged_analysis_3d` analyses the initial ground and each stage; Analysis → Run Construction Stages lists the results and shows any stage in the viewport. Each stage is an independent limit-equilibrium analysis with the same water table, loads and supports.
+- Construction stages (`Stage3D`, `slipsurface3d.stages`): box excavations and fills applied cumulatively, with a fill material inserted above the previous ground, on layered models and on extruded 2D-region models alike. A stage may set a new water level (`water_level`) that holds until changed again, and patch loads, point loads, bolts, geotextiles and pile rows act from their own `from_stage` onward. `run_staged_analysis_3d` analyses the initial ground and each stage; Analysis → Run Construction Stages lists the results and shows any stage in the viewport. Limit equilibrium carries no stress history: each stage is solved for the geometry, water and loads in force at that stage.
 - Particle Swarm global search (`surface_config.algorithm = "pso"`) as an alternative to Cuckoo Search.
+- The Nelder-Mead polish now starts from the best few distinct full-resolution candidates and restarts from the incumbent with a smaller simplex, which reduces seed-to-seed scatter of the critical FoS.
 
 ## Groundwater, seismic, reliability
 - 3D steady-state anisotropic seepage Laplace solver $\nabla \cdot (\mathbf{K}\nabla H) = 0$ with atmospheric seepage-face breakout.
@@ -43,11 +48,12 @@ Standalone 3D companion to SlipSurfaceIQ-LE. Licensed under GNU AGPL v3 or later
 - Lossless 2D `.slp.json` importer and extruder (`import_2d_project`) compatible with SlipSurfaceIQ-LE.
 - Ten constitutive models including 3D dip / dip-direction anisotropic bedding.
 - 3D patch/point loads, discrete reinforcement bolts, automatic bolt-pattern generator, and tension cracks.
-- 2D↔3D cross-section slicer and $F_{3D}/F_{2D}$ end-effect analyzer.
+- 2D↔3D cross-section slicer and $F_{3D}/F_{2D}$ end-effect analyzer. The extracted section carries weak layers, piezometric surfaces, staged fills and the design-standard load factors of the 3D model.
 - ESRI ASCII DEM, XYZ/CSV, binary/ASCII STL, Wavefront OBJ, and 3D DXF (`3DFACE`) exchange.
 
 ## Desktop UI, scripting, and verification
-- PySide6 + PyVista/VTK workstation with Wayland XWayland (`xcb`) fallback, offscreen rendering, live search preview, stop/cancel, picked-column free-body arrows, and ReportLab A4 PDF reports.
-- Python scripting and batch API (`slipsurface3d.scripting`).
+- PySide6 + PyVista/VTK workstation with Wayland XWayland (`xcb`) fallback, offscreen rendering, live search preview, stop/cancel, picked-column free-body arrows, and ReportLab A4 PDF reports. The PDF 3D view shows weak layers, geotextiles, pile rows and secondary failure modes.
+- Python scripting and batch API (`slipsurface3d.scripting`): `solve(..., algorithm=, n_local_minima=, design=)`, `run_stages`, `stage_project`, `design_preset`, plus the probabilistic, seismic and cross-section helpers.
+- Partial factors of the active design standard are applied consistently in the probabilistic, sensitivity, seismic $k_y$ and cross-section tools, so they report the same ODF basis as the main analysis.
 - Verified against the closed-form $\phi = 0$ 3D spherical cap (`< 0.01%` error), 2D cylindrical extrusion invariance (`|ΔFoS| < 1e-12` across `ny`, including GLE and Cheng & Yip), Zhang (1988) / Hungr et al. (1989) ellipsoid cases, 90° azimuth invariance, and Hoek & Bray (1981) 3D rock wedge (`|ΔFoS| < 1e-10`).
 - Interactive analyses default to a `28 × 24` column grid; published verification cases use `64–72` columns per axis.

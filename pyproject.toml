@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slipsurface3d"
-version = "2026.7.1"
+version = "0.1.0"
 description = "Three-dimensional limit-equilibrium slope stability analysis (Method of Columns + PyVista/Qt)."
 readme = "README.md"
 license = {file = "LICENSE"}

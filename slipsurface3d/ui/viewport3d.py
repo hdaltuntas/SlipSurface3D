@@ -11,6 +11,7 @@ Operates in two seamless modes:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,8 @@ from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from slipsurface3d.analysis import AnalysisResults3D
 from slipsurface3d.geometry.surfaces import SlipSurface3D
 from slipsurface3d.project import Project3D
+
+_log = logging.getLogger(__name__)
 
 SCALAR_FIELD_OPTIONS: list[tuple[str, str]] = [
     ("SigmaN_Eff_kPa", "Effective Normal Stress σ'n [kPa]"),
@@ -573,7 +576,7 @@ class Viewport3D(QWidget):
             try:
                 self._plotter.disable_picking()
             except Exception:
-                pass
+                _log.debug("disable_picking failed", exc_info=True)
 
             def _on_cell_picked(picked_grid: Any) -> None:
                 if picked_grid is not None and "ColumnIndex" in picked_grid.cell_data:
@@ -589,7 +592,7 @@ class Viewport3D(QWidget):
                     callback=_on_cell_picked, through=False, show=True, show_message=False
                 )
             except Exception:
-                pass
+                _log.warning("3D column picking is unavailable", exc_info=True)
         self._plotter.render()
 
     def export_screenshot(self, path: str, width: int = 1400, height: int = 900) -> None:
@@ -604,13 +607,13 @@ class Viewport3D(QWidget):
             try:
                 self._plotter.close()
             except Exception:
-                pass
+                _log.debug("Plotter close failed", exc_info=True)
             self._plotter = None
         if self._qvtk is not None:
             try:
                 self._qvtk.Finalize()
             except Exception:
-                pass
+                _log.debug("QVTK finalize failed", exc_info=True)
             self._qvtk = None
 
     def closeEvent(self, event: Any) -> None:  # noqa: N802

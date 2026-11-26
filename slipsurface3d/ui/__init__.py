@@ -58,7 +58,7 @@ def configure_qt_vtk_env(
             plugin_path = os.path.join(os.path.dirname(PySide6.__file__), "plugins", "platforms")
             if os.path.isdir(plugin_path):
                 target["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
-        except Exception:
+        except ImportError:
             pass  # Fall back to Qt's default search
 
     if plat.startswith("linux") and not target.get("QT_QPA_PLATFORM"):

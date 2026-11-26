@@ -29,6 +29,15 @@ def test_main_window_3d_compute_views_undo_and_exports(qapp, tmp_path: Path):
     assert win.viewport.is_offscreen
     assert win.project.ground is None
     assert win.project.summary.title == "Untitled 3D Project"
+    # An empty project can be saved and reopened, but not analysed
+    empty_file = tmp_path / "empty.slp3d.json"
+    win.project.save(empty_file)
+    assert Project3D.load(empty_file).ground is None
+    try:
+        win.compute_analysis(synchronous=True)
+        raise AssertionError("an empty project must not be analysed")
+    except ValueError as exc:
+        assert "no 3D geometry" in str(exc)
     win.load_builtin_example("zhang_1988_homog")
     win.compute_analysis(synchronous=True)
     assert win.results is not None

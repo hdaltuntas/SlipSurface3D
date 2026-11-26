@@ -323,7 +323,18 @@ class Project3D:
         self.z_min = min(self.z_min, z_min)
         self.profile_regions = []
 
-    def validate(self) -> None:
+    @property
+    def has_geometry(self) -> bool:
+        """True when a ground surface or borehole logs define the 3D model."""
+        return self.ground is not None or bool(self.boreholes)
+
+    def validate(self, require_geometry: bool = True) -> None:
+        """Check the project for consistency.
+
+        ``require_geometry=False`` accepts a project that has no ground surface or
+        boreholes yet (an empty project being set up), so it can still be saved and
+        reopened. Analyses always validate with geometry required.
+        """
         _assert_finite_tree(self.to_dict())
         if self.x_max <= self.x_min or self.y_max <= self.y_min:
             raise ValueError("Model domain bounds require x_max > x_min and y_max > y_min.")
@@ -337,12 +348,13 @@ class Project3D:
                 raise ValueError(f"{m.name}: unsupported material model {m.model!r}.")
             m.to_material()
 
-        if self.ground is None and not self.boreholes:
-            raise ValueError("Project3D requires a ground surface or borehole logs.")
-        if not self.layers and not self.profile_regions and not self.boreholes:
-            raise ValueError(
-                "Project3D requires at least one stratigraphic layer or extruded region."
-            )
+        if require_geometry or self.has_geometry:
+            if not self.has_geometry:
+                raise ValueError("Project3D requires a ground surface or borehole logs.")
+            if not self.layers and not self.profile_regions and not self.boreholes:
+                raise ValueError(
+                    "Project3D requires at least one stratigraphic layer or extruded region."
+                )
 
         a = self.analysis
         if not a.methods:
@@ -669,11 +681,11 @@ class Project3D:
             pile_rows=[PileRow3D.from_dict(r) for r in d.get("pile_rows", [])],
             stages=[Stage3D.from_dict(s) for s in d.get("stages", [])],
         )
-        proj.validate()
+        proj.validate(require_geometry=False)
         return proj
 
     def save(self, path: str | Path) -> Path:
-        self.validate()
+        self.validate(require_geometry=False)
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self.to_dict(), indent=2)
